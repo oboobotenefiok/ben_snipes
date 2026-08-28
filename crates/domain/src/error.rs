@@ -17,6 +17,9 @@ pub enum DomainError {
     #[error("venue name cannot be empty")]
     EmptyVenueName,
 
+    #[error("chain identifier cannot be empty")]
+    EmptyChain,
+
     #[error("order quantity must be positive, got {0}")]
     InvalidQuantity(String),
 

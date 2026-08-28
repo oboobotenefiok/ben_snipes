@@ -8,6 +8,8 @@
 //! spinning up mock servers or touching disk.
 
 mod acquisition;
+mod canonical;
+mod chain;
 mod error;
 mod listing;
 mod order;
@@ -16,6 +18,8 @@ mod safety;
 mod venue;
 
 pub use acquisition::{AcquisitionCriteria, ListingMetrics};
+pub use canonical::CanonicalTokenId;
+pub use chain::Chain;
 pub use error::DomainError;
 pub use listing::{Listing, Symbol};
 pub use order::{Order, OrderSide, OrderStatus};

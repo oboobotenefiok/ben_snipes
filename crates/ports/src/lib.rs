@@ -8,6 +8,7 @@
 //! makes it possible to swap a mock CEX adapter for a real MEXC adapter
 //! without touching a single line of application logic.
 
+mod acquisition_ledger;
 mod clock;
 mod error;
 mod exchange_client;
@@ -16,6 +17,7 @@ mod metrics_provider;
 mod state_store;
 mod token_safety_checker;
 
+pub use acquisition_ledger::AcquisitionLedger;
 pub use clock::Clock;
 pub use error::PortError;
 pub use exchange_client::ExchangeClient;

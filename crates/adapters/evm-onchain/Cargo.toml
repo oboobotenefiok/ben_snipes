@@ -1,0 +1,19 @@
+[package]
+name = "ben_snipes-adapter-evm-onchain"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Real EVM ListingSource that subscribes directly to a DEX factory contract's pair/pool-creation logs over a websocket RPC (eth_subscribe), rather than polling an indexer API. Chain-, factory-, and event-agnostic - configured per chain, not hardcoded to one network."
+
+[dependencies]
+ben_snipes-domain = { workspace = true }
+ben_snipes-ports = { workspace = true }
+ben_snipes-adapter-ws-support = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt"] }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }

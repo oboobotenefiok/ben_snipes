@@ -8,11 +8,10 @@ description = "Use-case orchestration: the services that coordinate domain rules
 [dependencies]
 ben_snipes-domain = { workspace = true }
 ben_snipes-ports = { workspace = true }
-async-trait = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 rust_decimal = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 time = { workspace = true }

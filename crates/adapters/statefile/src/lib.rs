@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tracing::debug;
 
+mod ledger;
+pub use ledger::FileAcquisitionLedger;
+
 pub struct StatefileStore {
     directory: PathBuf,
 }

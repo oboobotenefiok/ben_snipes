@@ -86,7 +86,7 @@ impl NewListingDetector {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ben_snipes_domain::{Symbol, Venue, VenueKind};
+    use ben_snipes_domain::{Chain, Symbol, Venue, VenueKind};
     use ben_snipes_ports::KnownListings;
     use std::sync::Mutex;
     use time::OffsetDateTime;
@@ -141,9 +141,10 @@ mod tests {
     }
 
     fn listing(symbol: &str) -> Listing {
-        let venue = Venue::new(VenueKind::Cex, "mexc").expect("literal venue name is valid");
+        let venue = Venue::new(VenueKind::Dex, "raydium").expect("literal venue name is valid");
+        let chain = Chain::new("solana").expect("literal chain is valid");
         let symbol = Symbol::new(symbol).expect("literal symbol is valid");
-        Listing::new(symbol, venue, OffsetDateTime::UNIX_EPOCH)
+        Listing::new(symbol, venue, chain, OffsetDateTime::UNIX_EPOCH)
     }
 
     #[tokio::test]

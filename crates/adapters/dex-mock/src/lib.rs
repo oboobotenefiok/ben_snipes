@@ -11,7 +11,9 @@
 //! crate needs to change.
 
 use async_trait::async_trait;
-use ben_snipes_domain::{Listing, ListingMetrics, Order, OrderStatus, SafetyReport, Symbol, Venue, VenueKind};
+use ben_snipes_domain::{
+    Chain, Listing, ListingMetrics, Order, OrderStatus, SafetyReport, Symbol, Venue, VenueKind,
+};
 use ben_snipes_ports::{
     ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError, TokenSafetyChecker,
 };
@@ -69,6 +71,7 @@ impl ListingSource for MockDexSource {
             .unwrap_or(0);
 
         let venue = Venue::new(VenueKind::Dex, self.venue_name.clone())?;
+        let chain = Chain::new("solana")?;
         let pools = self.pools.lock().await;
 
         let mut new_listings = Vec::new();
@@ -76,7 +79,7 @@ impl ListingSource for MockDexSource {
 
         for pool in pools.iter().filter(|p| p.block > since_block) {
             let symbol = Symbol::new(pool.symbol.clone())?;
-            new_listings.push(Listing::new(symbol, venue.clone(), OffsetDateTime::now_utc()));
+            new_listings.push(Listing::new(symbol, venue.clone(), chain.clone(), OffsetDateTime::now_utc()));
             latest_block = latest_block.max(pool.block);
         }
 

@@ -6,8 +6,10 @@ members = [
     "crates/application",
     "crates/config",
     "crates/adapters/statefile",
-    "crates/adapters/cex-mock",
     "crates/adapters/dex-mock",
+    "crates/adapters/ws-support",
+    "crates/adapters/pumpfun",
+    "crates/adapters/evm-onchain",
     "bin/runner",
 ]
 
@@ -16,6 +18,8 @@ members = [
 # the classic "two versions of tokio in one binary" problem.
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -31,8 +35,10 @@ ben_snipes-ports = { path = "crates/ports" }
 ben_snipes-application = { path = "crates/application" }
 ben_snipes-config = { path = "crates/config" }
 ben_snipes-adapter-statefile = { path = "crates/adapters/statefile" }
-ben_snipes-adapter-cex-mock = { path = "crates/adapters/cex-mock" }
 ben_snipes-adapter-dex-mock = { path = "crates/adapters/dex-mock" }
+ben_snipes-adapter-ws-support = { path = "crates/adapters/ws-support" }
+ben_snipes-adapter-pumpfun = { path = "crates/adapters/pumpfun" }
+ben_snipes-adapter-evm-onchain = { path = "crates/adapters/evm-onchain" }
 
 [profile.release]
 opt-level = 3

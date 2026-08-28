@@ -1,0 +1,25 @@
+[package]
+name = "ben_snipes-adapter-pumpfun"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Real Solana ListingSource backed by PumpPortal's free subscribeNewToken websocket feed, plus a real (but not yet ExchangeClient-wired) signing/broadcast path for their non-custodial Local Transaction API. See crate docs for the biggest caveat: solana-sdk recently went through a major breaking restructuring, so the signing code here is built on the lowest-level primitives verifiable at the time of writing, not on higher-level convenience APIs."
+
+[dependencies]
+ben_snipes-domain = { workspace = true }
+ben_snipes-ports = { workspace = true }
+ben_snipes-adapter-ws-support = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt"] }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+solana-sdk = "4"
+bincode = "1"
+bs58 = "0.5"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

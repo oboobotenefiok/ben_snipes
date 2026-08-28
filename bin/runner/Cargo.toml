@@ -15,8 +15,9 @@ ben_snipes-ports = { workspace = true }
 ben_snipes-application = { workspace = true }
 ben_snipes-config = { workspace = true }
 ben_snipes-adapter-statefile = { workspace = true }
-ben_snipes-adapter-cex-mock = { workspace = true }
 ben_snipes-adapter-dex-mock = { workspace = true }
+ben_snipes-adapter-pumpfun = { workspace = true }
+ben_snipes-adapter-evm-onchain = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

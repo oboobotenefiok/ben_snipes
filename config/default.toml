@@ -13,3 +13,29 @@ max_sell_tax_bps = 1000
 
 [storage]
 state_dir = "state"
+
+[solana]
+# PumpPortal's public data feed - free, no API key required for
+# subscribeNewToken. Only override this if you're pointing at a
+# self-hosted relay or a different environment.
+pumpportal_ws_url = "wss://pumpportal.fun/api/data"
+
+# Zero or more EVM chains to watch. Each entry spawns one real,
+# websocket-backed ListingSource. There is no usable default for
+# ws_rpc_url or topic0 - both are deployment-specific (your own RPC
+# provider key, and the actual event hash for the factory you're
+# watching) - see ben_snipes-adapter-evm-onchain's crate docs before
+# filling these in. Left empty by default so a fresh checkout doesn't
+# silently try to connect to a placeholder URL.
+# Example (uncomment and fill in to enable):
+# [[evm_chains]]
+# chain_name = "ethereum"
+# ws_rpc_url = "wss://YOUR-PROVIDER-WS-ENDPOINT-WITH-API-KEY"
+# factory_address = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"  # Uniswap V2 factory, mainnet
+# topic0 = "PUT-THE-VERIFIED-PairCreated-TOPIC-HASH-HERE"
+# base_assets = [
+#     "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
+#     "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
+#     "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
+# ]
+evm_chains = []

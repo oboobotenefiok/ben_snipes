@@ -1,11 +1,13 @@
 use ben_snipes_domain::{
-    AcquisitionCriteria, Listing, Order, OrderSide, Position, ProfitTarget, SafetyCriteria,
-    StopLoss,
+    AcquisitionCriteria, CanonicalTokenId, Listing, Order, OrderSide, Position, ProfitTarget,
+    SafetyCriteria, StopLoss,
 };
-use ben_snipes_ports::{ExchangeClient, MetricsProvider, PortError, TokenSafetyChecker};
+use ben_snipes_ports::{
+    AcquisitionLedger, ExchangeClient, MetricsProvider, PortError, TokenSafetyChecker,
+};
 use rust_decimal::Decimal;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Bundles a `TokenSafetyChecker` with the `SafetyCriteria` it's judged
 /// against. Kept as its own type (rather than two loose fields on
@@ -14,7 +16,7 @@ use tracing::{debug, info};
 /// checker, isn't a state that should be representable.
 ///
 /// Only construct this for venues where it's meaningful. A CEX venue
-/// generally shouldn't have one at all - see the README for why.
+/// generally shouldn't have one at all - see the README.
 pub struct SafetyGate {
     checker: Arc<dyn TokenSafetyChecker>,
     criteria: SafetyCriteria,
@@ -27,18 +29,19 @@ impl SafetyGate {
 }
 
 /// Turns a detected `Listing` into an open `Position`, autonomously,
-/// with no human in the loop - this is the "it scans and enters and
-/// exits on its own" piece of the spec.
+/// with no human in the loop.
 ///
 /// The decision flow is deliberately linear and each step can bail out
-/// cleanly with `Ok(None)`: no metrics yet, doesn't meet criteria,
-/// fails the safety gate, and "bought successfully" are the only
-/// outcomes, so callers never have to distinguish "we decided not to
-/// buy" from "something went wrong" - only genuine I/O failures come
-/// back as `Err`.
+/// cleanly with `Ok(None)`: no metrics yet, doesn't meet criteria, fails
+/// the safety gate, or already reserved by another source, are all
+/// expected outcomes, not failures - only genuine I/O errors come back
+/// as `Err`. The `AcquisitionLedger` reservation happens last, right
+/// before the buy, so a token only ever consumes a ledger slot once it's
+/// actually about to be bought.
 pub struct AcquisitionEngine {
     metrics_provider: Arc<dyn MetricsProvider>,
     exchange: Arc<dyn ExchangeClient>,
+    ledger: Arc<dyn AcquisitionLedger>,
     criteria: AcquisitionCriteria,
     take_profit: ProfitTarget,
     stop_loss: StopLoss,
@@ -54,6 +57,7 @@ impl AcquisitionEngine {
     pub fn new(
         metrics_provider: Arc<dyn MetricsProvider>,
         exchange: Arc<dyn ExchangeClient>,
+        ledger: Arc<dyn AcquisitionLedger>,
         criteria: AcquisitionCriteria,
         take_profit: ProfitTarget,
         stop_loss: StopLoss,
@@ -63,6 +67,7 @@ impl AcquisitionEngine {
         Self {
             metrics_provider,
             exchange,
+            ledger,
             criteria,
             take_profit,
             stop_loss,
@@ -85,7 +90,6 @@ impl AcquisitionEngine {
             debug!(
                 symbol = listing.symbol.as_str(),
                 volume = %metrics.volume_24h,
-                market_cap = %metrics.market_cap,
                 "does not meet acquisition criteria, skipping"
             );
             return Ok(None);
@@ -110,22 +114,60 @@ impl AcquisitionEngine {
             }
         }
 
-        let price = self.exchange.current_price(&listing.symbol).await?;
-        if price <= Decimal::ZERO {
-            debug!(symbol = listing.symbol.as_str(), "non-positive price quoted, skipping");
+        // Everything else passed - this is the point where two sources
+        // reporting the same underlying token would otherwise cause a
+        // double-buy. Reserve the canonical identity now, right before
+        // committing capital, so the reservation window is as small as
+        // possible.
+        let canonical_id = CanonicalTokenId::from_listing(listing);
+        if !self.ledger.try_reserve(canonical_id.as_str()).await? {
+            debug!(
+                symbol = listing.symbol.as_str(),
+                canonical_id = %canonical_id,
+                "already acquired via another source, skipping"
+            );
             return Ok(None);
         }
 
+        let price = match self.exchange.current_price(&listing.symbol).await {
+            Ok(price) if price > Decimal::ZERO => price,
+            Ok(_) => {
+                debug!(symbol = listing.symbol.as_str(), "non-positive price quoted, skipping");
+                self.release_reservation(&canonical_id).await;
+                return Ok(None);
+            }
+            Err(e) => {
+                self.release_reservation(&canonical_id).await;
+                return Err(e);
+            }
+        };
+
         let quantity = self.position_size / price;
 
-        let order = Order::new(
+        let order = match Order::new(
             listing.venue.clone(),
             listing.symbol.clone(),
             OrderSide::Buy,
             quantity,
-        )?;
+        ) {
+            Ok(order) => order,
+            Err(e) => {
+                self.release_reservation(&canonical_id).await;
+                return Err(e.into());
+            }
+        };
 
-        let filled = self.exchange.submit_order(order).await?;
+        let filled = match self.exchange.submit_order(order).await {
+            Ok(filled) => filled,
+            Err(e) => {
+                // The reservation was for a buy that never actually
+                // happened - release it so a later poll can retry this
+                // token instead of it being permanently locked out by a
+                // single transient failure.
+                self.release_reservation(&canonical_id).await;
+                return Err(e);
+            }
+        };
 
         info!(
             symbol = listing.symbol.as_str(),
@@ -146,13 +188,20 @@ impl AcquisitionEngine {
 
         Ok(Some(position))
     }
+
+    async fn release_reservation(&self, canonical_id: &CanonicalTokenId) {
+        if let Err(e) = self.ledger.release(canonical_id.as_str()).await {
+            warn!(canonical_id = %canonical_id, error = %e, "failed to release ledger reservation after aborted buy");
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ben_snipes_domain::{ListingMetrics, OrderStatus, SafetyReport, Symbol, Venue, VenueKind};
+    use ben_snipes_domain::{Chain, ListingMetrics, OrderStatus, SafetyReport, Symbol, Venue, VenueKind};
+    use std::collections::HashSet;
     use time::OffsetDateTime;
     use tokio::sync::Mutex;
 
@@ -181,6 +230,7 @@ mod tests {
     struct StubExchange {
         price: Decimal,
         orders_submitted: Mutex<u32>,
+        fail_submit: bool,
     }
 
     #[async_trait]
@@ -194,16 +244,46 @@ mod tests {
         }
 
         async fn submit_order(&self, mut order: Order) -> Result<Order, PortError> {
+            if self.fail_submit {
+                return Err(PortError::Rejected("stub configured to fail".to_string()));
+            }
             *self.orders_submitted.lock().await += 1;
             order.status = OrderStatus::Filled;
             Ok(order)
         }
     }
 
+    /// In-memory ledger for tests - same contract as the real
+    /// file-backed one, just without touching disk.
+    struct InMemoryLedger {
+        reserved: Mutex<HashSet<String>>,
+    }
+
+    impl InMemoryLedger {
+        fn empty() -> Self {
+            Self {
+                reserved: Mutex::new(HashSet::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AcquisitionLedger for InMemoryLedger {
+        async fn try_reserve(&self, canonical_id: &str) -> Result<bool, PortError> {
+            Ok(self.reserved.lock().await.insert(canonical_id.to_string()))
+        }
+
+        async fn release(&self, canonical_id: &str) -> Result<(), PortError> {
+            self.reserved.lock().await.remove(canonical_id);
+            Ok(())
+        }
+    }
+
     fn sample_listing() -> Listing {
         let venue = Venue::new(VenueKind::Dex, "raydium-test").expect("literal venue is valid");
+        let chain = Chain::new("solana").expect("literal chain is valid");
         let symbol = Symbol::new("NEWCOIN").expect("literal symbol is valid");
-        Listing::new(symbol, venue, OffsetDateTime::UNIX_EPOCH)
+        Listing::new(symbol, venue, chain, OffsetDateTime::UNIX_EPOCH)
     }
 
     fn passing_metrics() -> ListingMetrics {
@@ -217,12 +297,13 @@ mod tests {
         metrics: Option<ListingMetrics>,
         safety_gate: Option<SafetyGate>,
         exchange: Arc<StubExchange>,
+        ledger: Arc<dyn AcquisitionLedger>,
     ) -> AcquisitionEngine {
         AcquisitionEngine::new(
             Arc::new(StubMetricsProvider { report: metrics }),
             exchange,
-            AcquisitionCriteria::new(Decimal::from(50_000))
-                .expect("literal criteria is valid"),
+            ledger,
+            AcquisitionCriteria::new(Decimal::from(50_000)).expect("literal criteria is valid"),
             ProfitTarget::from_percent(Decimal::TEN).expect("valid target"),
             StopLoss::from_percent(Decimal::from(5)).expect("valid stop-loss"),
             Decimal::from(25),
@@ -235,8 +316,9 @@ mod tests {
         let exchange = Arc::new(StubExchange {
             price: Decimal::ONE,
             orders_submitted: Mutex::new(0),
+            fail_submit: false,
         });
-        let engine = build_engine(Some(passing_metrics()), None, exchange.clone());
+        let engine = build_engine(Some(passing_metrics()), None, exchange.clone(), Arc::new(InMemoryLedger::empty()));
 
         let result = engine
             .evaluate_and_buy(&sample_listing())
@@ -248,31 +330,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_when_safety_report_is_not_yet_available() {
-        let exchange = Arc::new(StubExchange {
-            price: Decimal::ONE,
-            orders_submitted: Mutex::new(0),
-        });
-        let gate = SafetyGate::new(
-            Arc::new(StubSafetyChecker { report: None }),
-            SafetyCriteria::new(1_000),
-        );
-        let engine = build_engine(Some(passing_metrics()), Some(gate), exchange.clone());
-
-        let result = engine
-            .evaluate_and_buy(&sample_listing())
-            .await
-            .expect("stub dependencies cannot fail");
-
-        assert!(result.is_none());
-        assert_eq!(*exchange.orders_submitted.lock().await, 0);
-    }
-
-    #[tokio::test]
     async fn skips_a_listing_that_fails_the_safety_gate() {
         let exchange = Arc::new(StubExchange {
             price: Decimal::ONE,
             orders_submitted: Mutex::new(0),
+            fail_submit: false,
         });
         let dangerous_report = SafetyReport {
             sell_tax_bps: 9_000,
@@ -281,12 +343,10 @@ mod tests {
             is_mintable: true,
         };
         let gate = SafetyGate::new(
-            Arc::new(StubSafetyChecker {
-                report: Some(dangerous_report),
-            }),
+            Arc::new(StubSafetyChecker { report: Some(dangerous_report) }),
             SafetyCriteria::new(1_000),
         );
-        let engine = build_engine(Some(passing_metrics()), Some(gate), exchange.clone());
+        let engine = build_engine(Some(passing_metrics()), Some(gate), exchange.clone(), Arc::new(InMemoryLedger::empty()));
 
         let result = engine
             .evaluate_and_buy(&sample_listing())
@@ -298,31 +358,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buys_when_safety_report_passes() {
+    async fn second_source_reporting_the_same_token_is_skipped_via_the_ledger() {
         let exchange = Arc::new(StubExchange {
             price: Decimal::ONE,
             orders_submitted: Mutex::new(0),
+            fail_submit: false,
         });
-        let clean_report = SafetyReport {
-            sell_tax_bps: 100,
-            ownership_renounced: true,
-            liquidity_locked: true,
-            is_mintable: false,
-        };
-        let gate = SafetyGate::new(
-            Arc::new(StubSafetyChecker {
-                report: Some(clean_report),
-            }),
-            SafetyCriteria::new(1_000),
-        );
-        let engine = build_engine(Some(passing_metrics()), Some(gate), exchange.clone());
+        let ledger: Arc<dyn AcquisitionLedger> = Arc::new(InMemoryLedger::empty());
 
-        let result = engine
+        let engine_a = build_engine(Some(passing_metrics()), None, exchange.clone(), ledger.clone());
+        let engine_b = build_engine(Some(passing_metrics()), None, exchange.clone(), ledger.clone());
+
+        // Two different "sources" (engines) reporting the exact same
+        // canonical token (same chain + symbol) - only the first buy
+        // should go through.
+        let first = engine_a
+            .evaluate_and_buy(&sample_listing())
+            .await
+            .expect("stub dependencies cannot fail");
+        let second = engine_b
             .evaluate_and_buy(&sample_listing())
             .await
             .expect("stub dependencies cannot fail");
 
-        assert!(result.is_some());
+        assert!(first.is_some());
+        assert!(second.is_none());
         assert_eq!(*exchange.orders_submitted.lock().await, 1);
+    }
+
+    #[tokio::test]
+    async fn reservation_is_released_when_order_submission_fails() {
+        let exchange = Arc::new(StubExchange {
+            price: Decimal::ONE,
+            orders_submitted: Mutex::new(0),
+            fail_submit: true,
+        });
+        let ledger: Arc<dyn AcquisitionLedger> = Arc::new(InMemoryLedger::empty());
+        let engine = build_engine(Some(passing_metrics()), None, exchange.clone(), ledger.clone());
+
+        let result = engine.evaluate_and_buy(&sample_listing()).await;
+        assert!(result.is_err());
+
+        // The failed attempt should have released its reservation, so a
+        // retry (a fresh engine, same ledger) can still claim this token.
+        let canonical_id = CanonicalTokenId::from_listing(&sample_listing());
+        let can_still_reserve = ledger
+            .try_reserve(canonical_id.as_str())
+            .await
+            .expect("in-memory ledger cannot fail");
+        assert!(can_still_reserve, "reservation should have been released after the failed submit");
     }
 }

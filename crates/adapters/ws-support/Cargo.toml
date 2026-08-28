@@ -1,0 +1,11 @@
+[package]
+name = "ben_snipes-adapter-ws-support"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared reconnect-with-backoff helper for websocket-backed adapters (pumpfun, evm-onchain). Not a ListingSource itself - just the connection-management piece both real-time adapters would otherwise duplicate."
+
+[dependencies]
+tokio = { workspace = true, features = ["net"] }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
