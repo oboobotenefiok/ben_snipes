@@ -1,0 +1,12 @@
+[package]
+name = "ben_snipes-config"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Typed application configuration loaded from config/default.toml, with environment variable overrides for secrets and per-environment tuning."
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+config = { workspace = true }
+rust_decimal = { workspace = true }

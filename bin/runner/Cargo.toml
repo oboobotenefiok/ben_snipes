@@ -1,0 +1,23 @@
+[package]
+name = "ben_snipes-runner"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The composition root: wires concrete adapters into the application layer's ports and runs the poll loop. This is the only crate in the workspace that's allowed to depend on every adapter at once."
+
+[[bin]]
+name = "ben_snipes"
+path = "src/main.rs"
+
+[dependencies]
+ben_snipes-domain = { workspace = true }
+ben_snipes-ports = { workspace = true }
+ben_snipes-application = { workspace = true }
+ben_snipes-config = { workspace = true }
+ben_snipes-adapter-statefile = { workspace = true }
+ben_snipes-adapter-cex-mock = { workspace = true }
+ben_snipes-adapter-dex-mock = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rust_decimal = { workspace = true }

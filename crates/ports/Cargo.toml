@@ -1,0 +1,14 @@
+[package]
+name = "ben_snipes-ports"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Trait definitions (ports) that adapters implement and the application layer depends on. This is the seam of the hexagon: application code only ever talks to these traits, never to a concrete exchange or database."
+
+[dependencies]
+ben_snipes-domain = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+rust_decimal = { workspace = true }
+time = { workspace = true }

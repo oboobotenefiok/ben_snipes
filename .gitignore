@@ -1,0 +1,5 @@
+/target
+/state
+*.tmp
+.env
+.DS_Store

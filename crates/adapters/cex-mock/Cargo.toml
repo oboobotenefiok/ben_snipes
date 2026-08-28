@@ -1,0 +1,14 @@
+[package]
+name = "ben_snipes-adapter-cex-mock"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A fake centralised-exchange adapter that implements ListingSource and ExchangeClient with in-memory canned data. Exists so the rest of the system can be built, wired, and tested before a real exchange integration (auth, rate limits, order signing) is written."
+
+[dependencies]
+ben_snipes-domain = { workspace = true }
+ben_snipes-ports = { workspace = true }
+async-trait = { workspace = true }
+rust_decimal = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }

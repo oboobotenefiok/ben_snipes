@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/domain",
+    "crates/ports",
+    "crates/application",
+    "crates/config",
+    "crates/adapters/statefile",
+    "crates/adapters/cex-mock",
+    "crates/adapters/dex-mock",
+    "bin/runner",
+]
+
+# Centralising versions here means every crate in the workspace pulls the
+# same version of a dependency, which keeps compile times sane and avoids
+# the classic "two versions of tokio in one binary" problem.
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+time = { version = "0.3", features = ["serde", "macros"] }
+config = "0.14"
+rust_decimal = { version = "1", features = ["serde-str"] }
+
+ben_snipes-domain = { path = "crates/domain" }
+ben_snipes-ports = { path = "crates/ports" }
+ben_snipes-application = { path = "crates/application" }
+ben_snipes-config = { path = "crates/config" }
+ben_snipes-adapter-statefile = { path = "crates/adapters/statefile" }
+ben_snipes-adapter-cex-mock = { path = "crates/adapters/cex-mock" }
+ben_snipes-adapter-dex-mock = { path = "crates/adapters/dex-mock" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

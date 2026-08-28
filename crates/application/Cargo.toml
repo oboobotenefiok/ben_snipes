@@ -1,0 +1,18 @@
+[package]
+name = "ben_snipes-application"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Use-case orchestration: the services that coordinate domain rules and ports to actually do something, like detecting new listings or managing an open position."
+
+[dependencies]
+ben_snipes-domain = { workspace = true }
+ben_snipes-ports = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync"] }
+time = { workspace = true }

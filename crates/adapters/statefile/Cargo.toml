@@ -1,0 +1,13 @@
+[package]
+name = "ben_snipes-adapter-statefile"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "ListingStateStore implementation backed by one JSON file per source on local disk. Simple, dependency-free persistence for sources that can't do incremental fetches and need a full-snapshot diff instead."
+
+[dependencies]
+ben_snipes-ports = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

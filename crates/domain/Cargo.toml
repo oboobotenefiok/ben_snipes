@@ -1,0 +1,12 @@
+[package]
+name = "ben_snipes-domain"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Core business types and rules for ben_snipes. No I/O, no async runtime, no adapters - just the shapes and logic that define what a listing, a position, and a profit target are."
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+rust_decimal = { workspace = true }

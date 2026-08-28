@@ -1,0 +1,15 @@
+[risk]
+take_profit_percent = "10.0"
+stop_loss_percent = "5.0"
+poll_interval_seconds = 5
+max_position_size = "25.0"
+min_volume_24h = "50000"
+
+[safety]
+# 1000 bps = 10%. Anything taxing a sell higher than this is treated as
+# a honeypot signal rather than an aggressive-but-legitimate tokenomics
+# choice - tune down if that's too permissive for your risk tolerance.
+max_sell_tax_bps = 1000
+
+[storage]
+state_dir = "state"

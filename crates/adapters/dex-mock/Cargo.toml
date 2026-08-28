@@ -1,0 +1,14 @@
+[package]
+name = "ben_snipes-adapter-dex-mock"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A fake DEX adapter implementing ListingSource and ExchangeClient, simulating a venue that supports cursor-based incremental fetching (e.g. 'give me pools created after block N') to exercise that path of the diff strategy."
+
+[dependencies]
+ben_snipes-domain = { workspace = true }
+ben_snipes-ports = { workspace = true }
+async-trait = { workspace = true }
+rust_decimal = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
