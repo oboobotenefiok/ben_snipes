@@ -12,7 +12,8 @@
 
 use async_trait::async_trait;
 use ben_snipes_domain::{
-    Chain, Listing, ListingMetrics, Order, OrderStatus, SafetyReport, Symbol, Venue, VenueKind,
+    Chain, FilledBuy, Listing, ListingMetrics, Order, OrderStatus, SafetyReport, Symbol, Venue,
+    VenueKind,
 };
 use ben_snipes_ports::{
     ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError, TokenSafetyChecker,
@@ -135,6 +136,17 @@ impl ExchangeClient for MockDexClient {
 
     async fn current_price(&self, _symbol: &Symbol) -> Result<Decimal, PortError> {
         Ok(*self.price.lock().await)
+    }
+
+    async fn submit_buy_by_amount(&self, _symbol: &Symbol, quote_amount: Decimal) -> Result<FilledBuy, PortError> {
+        let price = *self.price.lock().await;
+        if price <= Decimal::ZERO {
+            return Err(PortError::Rejected("mock price is non-positive".to_string()));
+        }
+        Ok(FilledBuy {
+            quantity: quote_amount / price,
+            entry_price: price,
+        })
     }
 
     async fn submit_order(&self, mut order: Order) -> Result<Order, PortError> {

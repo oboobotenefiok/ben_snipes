@@ -4,14 +4,16 @@
 //!
 //! CEX support has been deliberately dropped from this binary - new CEX
 //! listings are too rare and too slow relative to on-chain launches to
-//! be worth the surface area. Detection now runs on two real sources:
+//! be worth the surface area. Detection runs on two real sources:
 //! PumpPortal (Solana, via `ben_snipes-adapter-pumpfun`) and, per
 //! configured chain, a direct EVM factory-log subscription (via
-//! `ben_snipes-adapter-evm-onchain`). Neither can execute real trades
-//! yet - see each crate's docs and this file's `build_venues` for why
-//! that's a safe default rather than an oversight. A `dex-mock` demo
-//! venue is kept alongside them so `cargo run` still demonstrates the
-//! full buy -> hold -> exit pipeline end to end with synthetic data.
+//! `ben_snipes-adapter-evm-onchain`). Solana buy/sell execution is real
+//! when `SOLANA_PRIVATE_KEY` is set (falls back to detection-only
+//! otherwise, see `build_venues` below); EVM execution hasn't been
+//! built yet. A `dex-mock` demo venue is kept alongside both so `cargo
+//! run` still demonstrates the full buy -> hold -> exit pipeline end to
+//! end with synthetic data, independent of any real network access or
+//! funded wallet.
 
 use ben_snipes_adapter_dex_mock::{MockDexClient, MockDexSource};
 use ben_snipes_adapter_evm_onchain::{
@@ -19,8 +21,9 @@ use ben_snipes_adapter_evm_onchain::{
     NotYetImplementedMetrics as EvmNotYetImplementedMetrics,
 };
 use ben_snipes_adapter_pumpfun::{
-    NotYetImplementedExchange as SolNotYetImplementedExchange,
-    NotYetImplementedMetrics as SolNotYetImplementedMetrics, PumpPortalSource,
+    load_wallet, wallet_pubkey_string, NoWalletExchange,
+    NotYetImplementedMetrics as SolNotYetImplementedMetrics, PumpPortalExchangeClient,
+    PumpPortalSource,
 };
 use ben_snipes_adapter_statefile::{FileAcquisitionLedger, StatefileStore};
 use ben_snipes_application::{AcquisitionEngine, NewListingDetector, PositionManager, SafetyGate};
@@ -29,7 +32,7 @@ use ben_snipes_domain::{
     AcquisitionCriteria, ListingMetrics, Position, ProfitTarget, SafetyCriteria, SafetyReport,
     StopLoss,
 };
-use ben_snipes_ports::{AcquisitionLedger, ListingSource};
+use ben_snipes_ports::{AcquisitionLedger, ExchangeClient, ListingSource};
 use rust_decimal::Decimal;
 use std::fmt::Display;
 use std::sync::Arc;
@@ -123,15 +126,38 @@ async fn build_venues(
         PumpPortalSource::spawn(config.solana.pumpportal_ws_url.clone()),
         "solana pumpportal source",
     );
-    // No MetricsProvider or safety data exists for pump.fun tokens yet,
-    // so this engine will never actually buy - see
-    // ben_snipes-adapter-pumpfun's docs for why that's correct, not a
-    // bug. It still runs the full detect -> ledger-dedup pipeline, so
-    // wiring in real metrics/execution later is a drop-in swap.
+
+    // Wallet is optional at startup, deliberately: absence of a key
+    // should disable trading, not crash a bot that's otherwise perfectly
+    // capable of running in detection-only mode. See execution.rs for
+    // why this is the single highest-risk code path in the project if a
+    // wallet *is* configured.
+    let solana_exchange: Arc<dyn ExchangeClient> = match load_wallet() {
+        Ok(wallet) => {
+            info!(pubkey = %wallet_pubkey_string(&wallet), "solana wallet loaded - buy/sell execution is live");
+            Arc::new(PumpPortalExchangeClient::new(
+                wallet,
+                config.solana.rpc_url.clone(),
+                config.solana.slippage_percent,
+                config.solana.priority_fee_sol,
+            ))
+        }
+        Err(reason) => {
+            info!(reason = %reason, "no solana wallet configured - running pumpfun in detection-only mode");
+            Arc::new(NoWalletExchange)
+        }
+    };
+
+    // No MetricsProvider exists for pump.fun tokens yet, so this engine
+    // will never actually buy regardless of whether a wallet is
+    // configured - see ben_snipes-adapter-pumpfun's docs for why that's
+    // correct, not a bug. It still runs the full detect ->
+    // ledger-dedup pipeline, so wiring in real metrics later (the next
+    // step) makes buying live with zero changes here.
     venues.push(VenueHandle {
         acquisition: AcquisitionEngine::new(
             Arc::new(SolNotYetImplementedMetrics),
-            Arc::new(SolNotYetImplementedExchange),
+            solana_exchange.clone(),
             ledger.clone(),
             risk.criteria,
             risk.take_profit,
@@ -139,7 +165,7 @@ async fn build_venues(
             config.risk.max_position_size,
             None,
         ),
-        position_manager: PositionManager::new(Arc::new(SolNotYetImplementedExchange)),
+        position_manager: PositionManager::new(solana_exchange),
         source: Box::new(pumpfun_source),
     });
 

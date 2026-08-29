@@ -1,6 +1,6 @@
 use ben_snipes_domain::{
-    AcquisitionCriteria, CanonicalTokenId, Listing, Order, OrderSide, Position, ProfitTarget,
-    SafetyCriteria, StopLoss,
+    AcquisitionCriteria, CanonicalTokenId, Listing, Position, ProfitTarget, SafetyCriteria,
+    StopLoss,
 };
 use ben_snipes_ports::{
     AcquisitionLedger, ExchangeClient, MetricsProvider, PortError, TokenSafetyChecker,
@@ -129,35 +129,7 @@ impl AcquisitionEngine {
             return Ok(None);
         }
 
-        let price = match self.exchange.current_price(&listing.symbol).await {
-            Ok(price) if price > Decimal::ZERO => price,
-            Ok(_) => {
-                debug!(symbol = listing.symbol.as_str(), "non-positive price quoted, skipping");
-                self.release_reservation(&canonical_id).await;
-                return Ok(None);
-            }
-            Err(e) => {
-                self.release_reservation(&canonical_id).await;
-                return Err(e);
-            }
-        };
-
-        let quantity = self.position_size / price;
-
-        let order = match Order::new(
-            listing.venue.clone(),
-            listing.symbol.clone(),
-            OrderSide::Buy,
-            quantity,
-        ) {
-            Ok(order) => order,
-            Err(e) => {
-                self.release_reservation(&canonical_id).await;
-                return Err(e.into());
-            }
-        };
-
-        let filled = match self.exchange.submit_order(order).await {
+        let filled = match self.exchange.submit_buy_by_amount(&listing.symbol, self.position_size).await {
             Ok(filled) => filled,
             Err(e) => {
                 // The reservation was for a buy that never actually
@@ -172,7 +144,7 @@ impl AcquisitionEngine {
         info!(
             symbol = listing.symbol.as_str(),
             venue = %listing.venue,
-            entry_price = %price,
+            entry_price = %filled.entry_price,
             quantity = %filled.quantity,
             "autonomous buy executed"
         );
@@ -200,7 +172,9 @@ impl AcquisitionEngine {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ben_snipes_domain::{Chain, ListingMetrics, OrderStatus, SafetyReport, Symbol, Venue, VenueKind};
+    use ben_snipes_domain::{
+        Chain, FilledBuy, ListingMetrics, Order, OrderStatus, SafetyReport, Symbol, Venue, VenueKind,
+    };
     use std::collections::HashSet;
     use time::OffsetDateTime;
     use tokio::sync::Mutex;
@@ -228,9 +202,8 @@ mod tests {
     }
 
     struct StubExchange {
-        price: Decimal,
-        orders_submitted: Mutex<u32>,
-        fail_submit: bool,
+        buys_submitted: Mutex<u32>,
+        fail_buy: bool,
     }
 
     #[async_trait]
@@ -240,14 +213,23 @@ mod tests {
         }
 
         async fn current_price(&self, _symbol: &Symbol) -> Result<Decimal, PortError> {
-            Ok(self.price)
+            Ok(Decimal::ONE)
+        }
+
+        async fn submit_buy_by_amount(&self, _symbol: &Symbol, quote_amount: Decimal) -> Result<FilledBuy, PortError> {
+            if self.fail_buy {
+                return Err(PortError::Rejected("stub configured to fail".to_string()));
+            }
+            *self.buys_submitted.lock().await += 1;
+            // Stub venue: 1:1 price, so quantity acquired equals the
+            // amount spent.
+            Ok(FilledBuy {
+                quantity: quote_amount,
+                entry_price: Decimal::ONE,
+            })
         }
 
         async fn submit_order(&self, mut order: Order) -> Result<Order, PortError> {
-            if self.fail_submit {
-                return Err(PortError::Rejected("stub configured to fail".to_string()));
-            }
-            *self.orders_submitted.lock().await += 1;
             order.status = OrderStatus::Filled;
             Ok(order)
         }
@@ -314,9 +296,8 @@ mod tests {
     #[tokio::test]
     async fn buys_when_no_safety_gate_configured() {
         let exchange = Arc::new(StubExchange {
-            price: Decimal::ONE,
-            orders_submitted: Mutex::new(0),
-            fail_submit: false,
+            buys_submitted: Mutex::new(0),
+            fail_buy: false,
         });
         let engine = build_engine(Some(passing_metrics()), None, exchange.clone(), Arc::new(InMemoryLedger::empty()));
 
@@ -326,15 +307,14 @@ mod tests {
             .expect("stub dependencies cannot fail");
 
         assert!(result.is_some());
-        assert_eq!(*exchange.orders_submitted.lock().await, 1);
+        assert_eq!(*exchange.buys_submitted.lock().await, 1);
     }
 
     #[tokio::test]
     async fn skips_a_listing_that_fails_the_safety_gate() {
         let exchange = Arc::new(StubExchange {
-            price: Decimal::ONE,
-            orders_submitted: Mutex::new(0),
-            fail_submit: false,
+            buys_submitted: Mutex::new(0),
+            fail_buy: false,
         });
         let dangerous_report = SafetyReport {
             sell_tax_bps: 9_000,
@@ -354,15 +334,14 @@ mod tests {
             .expect("stub dependencies cannot fail");
 
         assert!(result.is_none());
-        assert_eq!(*exchange.orders_submitted.lock().await, 0);
+        assert_eq!(*exchange.buys_submitted.lock().await, 0);
     }
 
     #[tokio::test]
     async fn second_source_reporting_the_same_token_is_skipped_via_the_ledger() {
         let exchange = Arc::new(StubExchange {
-            price: Decimal::ONE,
-            orders_submitted: Mutex::new(0),
-            fail_submit: false,
+            buys_submitted: Mutex::new(0),
+            fail_buy: false,
         });
         let ledger: Arc<dyn AcquisitionLedger> = Arc::new(InMemoryLedger::empty());
 
@@ -383,15 +362,14 @@ mod tests {
 
         assert!(first.is_some());
         assert!(second.is_none());
-        assert_eq!(*exchange.orders_submitted.lock().await, 1);
+        assert_eq!(*exchange.buys_submitted.lock().await, 1);
     }
 
     #[tokio::test]
-    async fn reservation_is_released_when_order_submission_fails() {
+    async fn reservation_is_released_when_buy_submission_fails() {
         let exchange = Arc::new(StubExchange {
-            price: Decimal::ONE,
-            orders_submitted: Mutex::new(0),
-            fail_submit: true,
+            buys_submitted: Mutex::new(0),
+            fail_buy: true,
         });
         let ledger: Arc<dyn AcquisitionLedger> = Arc::new(InMemoryLedger::empty());
         let engine = build_engine(Some(passing_metrics()), None, exchange.clone(), ledger.clone());
@@ -406,6 +384,6 @@ mod tests {
             .try_reserve(canonical_id.as_str())
             .await
             .expect("in-memory ledger cannot fail");
-        assert!(can_still_reserve, "reservation should have been released after the failed submit");
+        assert!(can_still_reserve, "reservation should have been released after the failed buy");
     }
 }

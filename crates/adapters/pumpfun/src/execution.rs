@@ -67,6 +67,13 @@ pub fn load_wallet() -> Result<Keypair, String> {
         .map_err(|e| format!("SOLANA_PRIVATE_KEY did not decode to a valid keypair: {e}"))
 }
 
+/// Convenience for callers that just want to log/display the wallet's
+/// address without depending on `solana_sdk::signer::Signer` themselves
+/// - keeps that dependency an implementation detail of this crate.
+pub fn wallet_pubkey_string(wallet: &Keypair) -> String {
+    wallet.pubkey().to_string()
+}
+
 /// A trade to submit through PumpPortal's Local Transaction API.
 ///
 /// Note this is deliberately **not** shaped like `ExchangeClient::submit_order`

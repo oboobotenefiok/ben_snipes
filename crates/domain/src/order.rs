@@ -49,6 +49,18 @@ impl Order {
     }
 }
 
+/// The result of an amount-based buy (see `ExchangeClient::submit_buy_by_amount`):
+/// how many units were actually acquired, and the effective price that
+/// implies. Unlike a quantity-based `Order`, neither of these is known
+/// until *after* the trade executes - a venue like a bonding-curve DEX
+/// doesn't expose a pre-trade quote the way a CEX order book does, so
+/// the caller spends a known amount and finds out what it bought.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FilledBuy {
+    pub quantity: Decimal,
+    pub entry_price: Decimal,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

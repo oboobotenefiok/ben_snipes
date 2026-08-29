@@ -25,7 +25,8 @@
 use async_trait::async_trait;
 use ben_snipes_adapter_ws_support::connect_with_backoff;
 use ben_snipes_domain::{
-    Chain, DomainError, Listing, ListingMetrics, Order, SafetyReport, Symbol, Venue, VenueKind,
+    Chain, DomainError, FilledBuy, Listing, ListingMetrics, Order, SafetyReport, Symbol, Venue,
+    VenueKind,
 };
 use ben_snipes_ports::{
     ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError, TokenSafetyChecker,
@@ -38,8 +39,10 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 
+pub mod exchange_client;
 pub mod execution;
-pub use execution::{execute_trade, load_wallet, TradeAction, TradeRequest};
+pub use exchange_client::PumpPortalExchangeClient;
+pub use execution::{execute_trade, load_wallet, wallet_pubkey_string, TradeAction, TradeRequest};
 
 pub const DEFAULT_WS_URL: &str = "wss://pumpportal.fun/api/data";
 
@@ -170,31 +173,37 @@ impl TokenSafetyChecker for NotYetImplementedSafetyChecker {
     }
 }
 
-/// Always-erroring `ExchangeClient` placeholder. Deliberately not a
-/// "does nothing" stub - it's wired in purely to satisfy
-/// `AcquisitionEngine`'s type requirements. It should be structurally
-/// unreachable, because `NotYetImplementedMetrics` always returns
-/// `None`, which makes `AcquisitionEngine` bail out before it ever
-/// calls into an exchange client. If this ever actually gets invoked,
-/// something upstream changed in a way that needs re-auditing - hence
-/// the loud error rather than a silent no-op.
-pub struct NotYetImplementedExchange;
+/// `ExchangeClient` fallback used when no wallet is configured
+/// (`SOLANA_PRIVATE_KEY` unset) - see `execution::load_wallet`. Buy and
+/// sell genuinely work via `PumpPortalExchangeClient` once a wallet is
+/// present; this type exists so the bot can still run in
+/// detection-only mode without one, rather than refusing to start.
+/// `current_price` errors regardless of wallet configuration - live
+/// Solana price monitoring isn't built yet (see the crate/README docs),
+/// so this method is honest either way.
+pub struct NoWalletExchange;
 
 #[async_trait]
-impl ExchangeClient for NotYetImplementedExchange {
+impl ExchangeClient for NoWalletExchange {
     fn venue_name(&self) -> &str {
         "pumpfun"
     }
 
     async fn current_price(&self, _symbol: &Symbol) -> Result<Decimal, PortError> {
         Err(PortError::Rejected(
-            "real Solana trade execution is not yet implemented - see README".to_string(),
+            "real-time Solana price monitoring is not yet implemented - see README".to_string(),
+        ))
+    }
+
+    async fn submit_buy_by_amount(&self, _symbol: &Symbol, _quote_amount: Decimal) -> Result<FilledBuy, PortError> {
+        Err(PortError::Rejected(
+            "no wallet configured (SOLANA_PRIVATE_KEY not set) - see execution module docs".to_string(),
         ))
     }
 
     async fn submit_order(&self, _order: Order) -> Result<Order, PortError> {
         Err(PortError::Rejected(
-            "real Solana trade execution is not yet implemented - see README".to_string(),
+            "no wallet configured (SOLANA_PRIVATE_KEY not set) - see execution module docs".to_string(),
         ))
     }
 }

@@ -28,7 +28,10 @@
 
 use async_trait::async_trait;
 use ben_snipes_adapter_ws_support::connect_with_backoff;
-use ben_snipes_domain::{Chain, DomainError, Listing, ListingMetrics, Order, SafetyReport, Symbol, Venue, VenueKind};
+use ben_snipes_domain::{
+    Chain, DomainError, FilledBuy, Listing, ListingMetrics, Order, SafetyReport, Symbol, Venue,
+    VenueKind,
+};
 use ben_snipes_ports::{
     ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError, TokenSafetyChecker,
 };
@@ -236,6 +239,12 @@ impl ExchangeClient for NotYetImplementedExchange {
     }
 
     async fn current_price(&self, _symbol: &Symbol) -> Result<Decimal, PortError> {
+        Err(PortError::Rejected(
+            "real EVM trade execution is not yet implemented - see README".to_string(),
+        ))
+    }
+
+    async fn submit_buy_by_amount(&self, _symbol: &Symbol, _quote_amount: Decimal) -> Result<FilledBuy, PortError> {
         Err(PortError::Rejected(
             "real EVM trade execution is not yet implemented - see README".to_string(),
         ))

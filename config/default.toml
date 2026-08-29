@@ -20,6 +20,18 @@ state_dir = "state"
 # self-hosted relay or a different environment.
 pumpportal_ws_url = "wss://pumpportal.fun/api/data"
 
+# Public RPC endpoints are typically rate-limited too aggressively for
+# real trading (broadcast + confirmation polling + balance checks add
+# up fast) - replace this with your own provider before running with a
+# funded wallet. Left as a public endpoint by default so detection-only
+# mode (no SOLANA_PRIVATE_KEY set) still has something to point at.
+rpc_url = "https://api.mainnet-beta.solana.com"
+
+# Passed straight through to PumpPortal's trade-local API on every
+# buy/sell.
+slippage_percent = 10
+priority_fee_sol = "0.0001"
+
 # Zero or more EVM chains to watch. Each entry spawns one real,
 # websocket-backed ListingSource. There is no usable default for
 # ws_rpc_url or topic0 - both are deployment-specific (your own RPC

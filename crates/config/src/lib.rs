@@ -56,11 +56,31 @@ pub struct StorageConfig {
     pub state_dir: String,
 }
 
+/// Solana execution settings. Deliberately has no field for the wallet
+/// key - see `ben_snipes-adapter-pumpfun::execution::load_wallet`,
+/// which reads the `SOLANA_PRIVATE_KEY` environment variable directly,
+/// never config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SolanaConfig {
     /// PumpPortal's data websocket URL. Defaults to their public free
     /// endpoint - no API key needed for `subscribeNewToken`.
     pub pumpportal_ws_url: String,
+
+    /// A Solana JSON-RPC HTTP endpoint used for broadcasting signed
+    /// transactions and checking balances/confirmations. Unlike
+    /// `pumpportal_ws_url`, this should be your own provider (public
+    /// endpoints are typically rate-limited too aggressively for
+    /// trading use).
+    pub rpc_url: String,
+
+    /// Slippage tolerance, as a percent, passed through to PumpPortal's
+    /// trade-local API on every buy/sell.
+    pub slippage_percent: u32,
+
+    /// Priority fee in SOL, passed through to PumpPortal's trade-local
+    /// API on every buy/sell - helps transactions land faster under
+    /// network congestion.
+    pub priority_fee_sol: Decimal,
 }
 
 #[derive(Debug, Clone, Deserialize)]

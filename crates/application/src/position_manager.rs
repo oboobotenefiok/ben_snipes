@@ -53,7 +53,7 @@ impl PositionManager {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ben_snipes_domain::{OrderStatus, ProfitTarget, StopLoss, Symbol, Venue, VenueKind};
+    use ben_snipes_domain::{FilledBuy, OrderStatus, ProfitTarget, StopLoss, Symbol, Venue, VenueKind};
     use rust_decimal::Decimal;
 
     struct StubExchange {
@@ -68,6 +68,10 @@ mod tests {
 
         async fn current_price(&self, _symbol: &Symbol) -> Result<Decimal, PortError> {
             Ok(self.price)
+        }
+
+        async fn submit_buy_by_amount(&self, _symbol: &Symbol, _quote_amount: Decimal) -> Result<FilledBuy, PortError> {
+            unreachable!("PositionManager only ever calls current_price/submit_order, never submit_buy_by_amount")
         }
 
         async fn submit_order(&self, mut order: Order) -> Result<Order, PortError> {
