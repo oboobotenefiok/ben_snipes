@@ -5,10 +5,14 @@
 //! their side. See `execution`'s module doc comment for the signing-code
 //! verification caveat before running this with real funds.
 //!
-//! `current_price` is the one method genuinely not implemented here: it
-//! needs a live price feed (bonding-curve account reads, or subscribing
-//! to PumpPortal's trade stream), which is separate infrastructure this
-//! crate doesn't build yet - see the README.
+//! `current_price` is backed by `price_feed::fetch_price` (Jupiter's
+//! Price API v3, converted to SOL-denominated terms to match
+//! `entry_price` elsewhere in this codebase - see that module's doc
+//! comment for why the conversion matters). This is a real,
+//! well-corroborated integration, but it's an external network
+//! dependency that returns "no data yet" for very fresh tokens - a
+//! position can briefly have no way to check its exit condition right
+//! after buying, until the token gets indexed.
 //!
 //! **Confirming a buy landed:** after broadcasting, this polls
 //! `getSignatureStatuses` until the transaction is confirmed (or errors
@@ -21,6 +25,7 @@
 //! against a real RPC response shape on first run.
 
 use crate::execution::{execute_trade, TradeAction, TradeRequest};
+use crate::price_feed;
 use async_trait::async_trait;
 use ben_snipes_domain::{FilledBuy, Order, OrderSide, OrderStatus, Symbol};
 use ben_snipes_ports::{ExchangeClient, PortError};
@@ -157,10 +162,10 @@ impl ExchangeClient for PumpPortalExchangeClient {
         "pumpfun"
     }
 
-    async fn current_price(&self, _symbol: &Symbol) -> Result<Decimal, PortError> {
-        Err(PortError::Rejected(
-            "real-time Solana price monitoring is not yet implemented (needs bonding-curve reads or a live trade-stream subscription) - see README".to_string(),
-        ))
+    async fn current_price(&self, symbol: &Symbol) -> Result<Decimal, PortError> {
+        price_feed::fetch_price(&self.http, symbol.as_str())
+            .await
+            .map_err(PortError::Rejected)
     }
 
     async fn submit_buy_by_amount(&self, symbol: &Symbol, quote_amount: Decimal) -> Result<FilledBuy, PortError> {

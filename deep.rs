@@ -3,7 +3,12 @@
 take_profit_percent = "10.0"
 stop_loss_percent = "5.0"
 poll_interval_seconds = 5
-max_position_size = "25.0"
+# This is the real SOL amount spent per buy on the live Solana venue
+# (not just the demo) - see the README's "Automation & execution
+# platforms" before raising this. 0.01 SOL is a deliberately small
+# starting default now that this number has real financial teeth,
+# not a suggestion of what's "enough" to trade meaningfully.
+max_position_size = "0.01"
 min_volume_24h = "50000"
 
 [safety]
@@ -20,6 +25,18 @@ state_dir = "state"
 # subscribeNewToken. Only override this if you're pointing at a
 # self-hosted relay or a different environment.
 pumpportal_ws_url = "wss://pumpportal.fun/api/data"
+
+# Public RPC endpoints are typically rate-limited too aggressively for
+# real trading (broadcast + confirmation polling + balance checks add
+# up fast) - replace this with your own provider before running with a
+# funded wallet. Left as a public endpoint by default so detection-only
+# mode (no SOLANA_PRIVATE_KEY set) still has something to point at.
+rpc_url = "https://api.mainnet-beta.solana.com"
+
+# Passed straight through to PumpPortal's trade-local API on every
+# buy/sell.
+slippage_percent = 10
+priority_fee_sol = "0.0001"
 
 # Zero or more EVM chains to watch. Each entry spawns one real,
 # websocket-backed ListingSource. There is no usable default for
@@ -150,11 +167,31 @@ pub struct StorageConfig {
     pub state_dir: String,
 }
 
+/// Solana execution settings. Deliberately has no field for the wallet
+/// key - see `ben_snipes-adapter-pumpfun::execution::load_wallet`,
+/// which reads the `SOLANA_PRIVATE_KEY` environment variable directly,
+/// never config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SolanaConfig {
     /// PumpPortal's data websocket URL. Defaults to their public free
     /// endpoint - no API key needed for `subscribeNewToken`.
     pub pumpportal_ws_url: String,
+
+    /// A Solana JSON-RPC HTTP endpoint used for broadcasting signed
+    /// transactions and checking balances/confirmations. Unlike
+    /// `pumpportal_ws_url`, this should be your own provider (public
+    /// endpoints are typically rate-limited too aggressively for
+    /// trading use).
+    pub rpc_url: String,
+
+    /// Slippage tolerance, as a percent, passed through to PumpPortal's
+    /// trade-local API on every buy/sell.
+    pub slippage_percent: u32,
+
+    /// Priority fee in SOL, passed through to PumpPortal's trade-local
+    /// API on every buy/sell - helps transactions land faster under
+    /// network congestion.
+    pub priority_fee_sol: Decimal,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -275,7 +312,7 @@ impl PositionManager {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ben_snipes_domain::{OrderStatus, ProfitTarget, StopLoss, Symbol, Venue, VenueKind};
+    use ben_snipes_domain::{FilledBuy, OrderStatus, ProfitTarget, StopLoss, Symbol, Venue, VenueKind};
     use rust_decimal::Decimal;
 
     struct StubExchange {
@@ -290,6 +327,10 @@ mod tests {
 
         async fn current_price(&self, _symbol: &Symbol) -> Result<Decimal, PortError> {
             Ok(self.price)
+        }
+
+        async fn submit_buy_by_amount(&self, _symbol: &Symbol, _quote_amount: Decimal) -> Result<FilledBuy, PortError> {
+            unreachable!("PositionManager only ever calls current_price/submit_order, never submit_buy_by_amount")
         }
 
         async fn submit_order(&self, mut order: Order) -> Result<Order, PortError> {
@@ -579,8 +620,8 @@ pub use position_manager::PositionManager;
 
 --- ./crates/application/src/acquisition_engine.rs ---
 use ben_snipes_domain::{
-    AcquisitionCriteria, CanonicalTokenId, Listing, Order, OrderSide, Position, ProfitTarget,
-    SafetyCriteria, StopLoss,
+    AcquisitionCriteria, CanonicalTokenId, Listing, Position, ProfitTarget, SafetyCriteria,
+    StopLoss,
 };
 use ben_snipes_ports::{
     AcquisitionLedger, ExchangeClient, MetricsProvider, PortError, TokenSafetyChecker,
@@ -709,35 +750,7 @@ impl AcquisitionEngine {
             return Ok(None);
         }
 
-        let price = match self.exchange.current_price(&listing.symbol).await {
-            Ok(price) if price > Decimal::ZERO => price,
-            Ok(_) => {
-                debug!(symbol = listing.symbol.as_str(), "non-positive price quoted, skipping");
-                self.release_reservation(&canonical_id).await;
-                return Ok(None);
-            }
-            Err(e) => {
-                self.release_reservation(&canonical_id).await;
-                return Err(e);
-            }
-        };
-
-        let quantity = self.position_size / price;
-
-        let order = match Order::new(
-            listing.venue.clone(),
-            listing.symbol.clone(),
-            OrderSide::Buy,
-            quantity,
-        ) {
-            Ok(order) => order,
-            Err(e) => {
-                self.release_reservation(&canonical_id).await;
-                return Err(e.into());
-            }
-        };
-
-        let filled = match self.exchange.submit_order(order).await {
+        let filled = match self.exchange.submit_buy_by_amount(&listing.symbol, self.position_size).await {
             Ok(filled) => filled,
             Err(e) => {
                 // The reservation was for a buy that never actually
@@ -752,7 +765,7 @@ impl AcquisitionEngine {
         info!(
             symbol = listing.symbol.as_str(),
             venue = %listing.venue,
-            entry_price = %price,
+            entry_price = %filled.entry_price,
             quantity = %filled.quantity,
             "autonomous buy executed"
         );
@@ -780,7 +793,9 @@ impl AcquisitionEngine {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ben_snipes_domain::{Chain, ListingMetrics, OrderStatus, SafetyReport, Symbol, Venue, VenueKind};
+    use ben_snipes_domain::{
+        Chain, FilledBuy, ListingMetrics, Order, OrderStatus, SafetyReport, Symbol, Venue, VenueKind,
+    };
     use std::collections::HashSet;
     use time::OffsetDateTime;
     use tokio::sync::Mutex;
@@ -808,9 +823,8 @@ mod tests {
     }
 
     struct StubExchange {
-        price: Decimal,
-        orders_submitted: Mutex<u32>,
-        fail_submit: bool,
+        buys_submitted: Mutex<u32>,
+        fail_buy: bool,
     }
 
     #[async_trait]
@@ -820,14 +834,23 @@ mod tests {
         }
 
         async fn current_price(&self, _symbol: &Symbol) -> Result<Decimal, PortError> {
-            Ok(self.price)
+            Ok(Decimal::ONE)
+        }
+
+        async fn submit_buy_by_amount(&self, _symbol: &Symbol, quote_amount: Decimal) -> Result<FilledBuy, PortError> {
+            if self.fail_buy {
+                return Err(PortError::Rejected("stub configured to fail".to_string()));
+            }
+            *self.buys_submitted.lock().await += 1;
+            // Stub venue: 1:1 price, so quantity acquired equals the
+            // amount spent.
+            Ok(FilledBuy {
+                quantity: quote_amount,
+                entry_price: Decimal::ONE,
+            })
         }
 
         async fn submit_order(&self, mut order: Order) -> Result<Order, PortError> {
-            if self.fail_submit {
-                return Err(PortError::Rejected("stub configured to fail".to_string()));
-            }
-            *self.orders_submitted.lock().await += 1;
             order.status = OrderStatus::Filled;
             Ok(order)
         }
@@ -894,9 +917,8 @@ mod tests {
     #[tokio::test]
     async fn buys_when_no_safety_gate_configured() {
         let exchange = Arc::new(StubExchange {
-            price: Decimal::ONE,
-            orders_submitted: Mutex::new(0),
-            fail_submit: false,
+            buys_submitted: Mutex::new(0),
+            fail_buy: false,
         });
         let engine = build_engine(Some(passing_metrics()), None, exchange.clone(), Arc::new(InMemoryLedger::empty()));
 
@@ -906,15 +928,14 @@ mod tests {
             .expect("stub dependencies cannot fail");
 
         assert!(result.is_some());
-        assert_eq!(*exchange.orders_submitted.lock().await, 1);
+        assert_eq!(*exchange.buys_submitted.lock().await, 1);
     }
 
     #[tokio::test]
     async fn skips_a_listing_that_fails_the_safety_gate() {
         let exchange = Arc::new(StubExchange {
-            price: Decimal::ONE,
-            orders_submitted: Mutex::new(0),
-            fail_submit: false,
+            buys_submitted: Mutex::new(0),
+            fail_buy: false,
         });
         let dangerous_report = SafetyReport {
             sell_tax_bps: 9_000,
@@ -934,15 +955,14 @@ mod tests {
             .expect("stub dependencies cannot fail");
 
         assert!(result.is_none());
-        assert_eq!(*exchange.orders_submitted.lock().await, 0);
+        assert_eq!(*exchange.buys_submitted.lock().await, 0);
     }
 
     #[tokio::test]
     async fn second_source_reporting_the_same_token_is_skipped_via_the_ledger() {
         let exchange = Arc::new(StubExchange {
-            price: Decimal::ONE,
-            orders_submitted: Mutex::new(0),
-            fail_submit: false,
+            buys_submitted: Mutex::new(0),
+            fail_buy: false,
         });
         let ledger: Arc<dyn AcquisitionLedger> = Arc::new(InMemoryLedger::empty());
 
@@ -963,15 +983,14 @@ mod tests {
 
         assert!(first.is_some());
         assert!(second.is_none());
-        assert_eq!(*exchange.orders_submitted.lock().await, 1);
+        assert_eq!(*exchange.buys_submitted.lock().await, 1);
     }
 
     #[tokio::test]
-    async fn reservation_is_released_when_order_submission_fails() {
+    async fn reservation_is_released_when_buy_submission_fails() {
         let exchange = Arc::new(StubExchange {
-            price: Decimal::ONE,
-            orders_submitted: Mutex::new(0),
-            fail_submit: true,
+            buys_submitted: Mutex::new(0),
+            fail_buy: true,
         });
         let ledger: Arc<dyn AcquisitionLedger> = Arc::new(InMemoryLedger::empty());
         let engine = build_engine(Some(passing_metrics()), None, exchange.clone(), ledger.clone());
@@ -986,7 +1005,7 @@ mod tests {
             .try_reserve(canonical_id.as_str())
             .await
             .expect("in-memory ledger cannot fail");
-        assert!(can_still_reserve, "reservation should have been released after the failed submit");
+        assert!(can_still_reserve, "reservation should have been released after the failed buy");
     }
 }
 
@@ -1012,7 +1031,7 @@ time = { workspace = true }
 --- ./crates/ports/src/exchange_client.rs ---
 use crate::PortError;
 use async_trait::async_trait;
-use ben_snipes_domain::{Order, Symbol};
+use ben_snipes_domain::{FilledBuy, Order, Symbol};
 use rust_decimal::Decimal;
 
 /// Trading operations against a single venue. A CEX adapter implements
@@ -1024,13 +1043,31 @@ use rust_decimal::Decimal;
 pub trait ExchangeClient: Send + Sync {
     fn venue_name(&self) -> &str;
 
-    /// Current price of `symbol` in the venue's quote asset.
+    /// Current price of `symbol` in the venue's quote asset. Used for
+    /// exit monitoring (deciding *when* a position has crossed its
+    /// take-profit/stop-loss) - not for entry sizing, see
+    /// `submit_buy_by_amount`.
     async fn current_price(&self, symbol: &Symbol) -> Result<Decimal, PortError>;
 
+    /// Buys `symbol` by spending `quote_amount` of the venue's quote
+    /// asset (e.g. SOL, USDT), and reports back what was actually
+    /// acquired. This is the entry point for opening a position -
+    /// deliberately amount-based rather than quantity-based, because
+    /// venues without a queryable pre-trade order book (a bonding-curve
+    /// DEX, for instance) can't offer a quantity-for-a-given-price quote
+    /// the way a CEX can. A CEX-style adapter that *does* have a live
+    /// order book is free to fetch its own price internally and convert;
+    /// the port doesn't force that round-trip on venues that don't need
+    /// it.
+    async fn submit_buy_by_amount(&self, symbol: &Symbol, quote_amount: Decimal) -> Result<FilledBuy, PortError>;
+
     /// Submit an order and return it with the venue's response applied
-    /// (fill status, etc). Implementations are responsible for their own
-    /// slippage/gas handling internally - the port only cares about intent
-    /// in, result out.
+    /// (fill status, etc). In practice this is the exit/sell path - the
+    /// quantity being sold is already known (it's the position being
+    /// closed), which is why selling stays quantity-based even on
+    /// venues where buying is amount-based. Implementations are
+    /// responsible for their own slippage/gas handling internally - the
+    /// port only cares about intent in, result out.
     async fn submit_order(&self, order: Order) -> Result<Order, PortError>;
 }
 
@@ -1336,6 +1373,18 @@ impl Order {
             status: OrderStatus::Pending,
         })
     }
+}
+
+/// The result of an amount-based buy (see `ExchangeClient::submit_buy_by_amount`):
+/// how many units were actually acquired, and the effective price that
+/// implies. Unlike a quantity-based `Order`, neither of these is known
+/// until *after* the trade executes - a venue like a bonding-curve DEX
+/// doesn't expose a pre-trade quote the way a CEX order book does, so
+/// the caller spends a known amount and finds out what it bought.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FilledBuy {
+    pub quantity: Decimal,
+    pub entry_price: Decimal,
 }
 
 #[cfg(test)]
@@ -1682,7 +1731,7 @@ pub use canonical::CanonicalTokenId;
 pub use chain::Chain;
 pub use error::DomainError;
 pub use listing::{Listing, Symbol};
-pub use order::{Order, OrderSide, OrderStatus};
+pub use order::{FilledBuy, Order, OrderSide, OrderStatus};
 pub use position::{ExitReason, Position, ProfitTarget, StopLoss};
 pub use safety::{SafetyCriteria, SafetyReport};
 pub use venue::{Venue, VenueKind};
@@ -2485,7 +2534,8 @@ tracing = { workspace = true }
 
 use async_trait::async_trait;
 use ben_snipes_domain::{
-    Chain, Listing, ListingMetrics, Order, OrderStatus, SafetyReport, Symbol, Venue, VenueKind,
+    Chain, FilledBuy, Listing, ListingMetrics, Order, OrderStatus, SafetyReport, Symbol, Venue,
+    VenueKind,
 };
 use ben_snipes_ports::{
     ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError, TokenSafetyChecker,
@@ -2608,6 +2658,17 @@ impl ExchangeClient for MockDexClient {
 
     async fn current_price(&self, _symbol: &Symbol) -> Result<Decimal, PortError> {
         Ok(*self.price.lock().await)
+    }
+
+    async fn submit_buy_by_amount(&self, _symbol: &Symbol, quote_amount: Decimal) -> Result<FilledBuy, PortError> {
+        let price = *self.price.lock().await;
+        if price <= Decimal::ZERO {
+            return Err(PortError::Rejected("mock price is non-positive".to_string()));
+        }
+        Ok(FilledBuy {
+            quantity: quote_amount / price,
+            entry_price: price,
+        })
     }
 
     async fn submit_order(&self, mut order: Order) -> Result<Order, PortError> {
@@ -2913,7 +2974,8 @@ tracing = { workspace = true }
 use async_trait::async_trait;
 use ben_snipes_adapter_ws_support::connect_with_backoff;
 use ben_snipes_domain::{
-    Chain, DomainError, Listing, ListingMetrics, Order, SafetyReport, Symbol, Venue, VenueKind,
+    Chain, DomainError, FilledBuy, Listing, ListingMetrics, Order, SafetyReport, Symbol, Venue,
+    VenueKind,
 };
 use ben_snipes_ports::{
     ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError, TokenSafetyChecker,
@@ -2926,8 +2988,15 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 
+pub mod exchange_client;
 pub mod execution;
-pub use execution::{execute_trade, load_wallet, TradeAction, TradeRequest};
+pub mod metrics_provider;
+pub mod price_feed;
+pub mod safety_checker;
+pub use exchange_client::PumpPortalExchangeClient;
+pub use execution::{execute_trade, load_wallet, wallet_pubkey_string, TradeAction, TradeRequest};
+pub use metrics_provider::DexScreenerMetricsProvider;
+pub use safety_checker::RugCheckSafetyChecker;
 
 pub const DEFAULT_WS_URL: &str = "wss://pumpportal.fun/api/data";
 
@@ -3058,31 +3127,37 @@ impl TokenSafetyChecker for NotYetImplementedSafetyChecker {
     }
 }
 
-/// Always-erroring `ExchangeClient` placeholder. Deliberately not a
-/// "does nothing" stub - it's wired in purely to satisfy
-/// `AcquisitionEngine`'s type requirements. It should be structurally
-/// unreachable, because `NotYetImplementedMetrics` always returns
-/// `None`, which makes `AcquisitionEngine` bail out before it ever
-/// calls into an exchange client. If this ever actually gets invoked,
-/// something upstream changed in a way that needs re-auditing - hence
-/// the loud error rather than a silent no-op.
-pub struct NotYetImplementedExchange;
+/// `ExchangeClient` fallback used when no wallet is configured
+/// (`SOLANA_PRIVATE_KEY` unset) - see `execution::load_wallet`. Buy and
+/// sell genuinely work via `PumpPortalExchangeClient` once a wallet is
+/// present; this type exists so the bot can still run in
+/// detection-only mode without one, rather than refusing to start.
+/// `current_price` errors regardless of wallet configuration - live
+/// Solana price monitoring isn't built yet (see the crate/README docs),
+/// so this method is honest either way.
+pub struct NoWalletExchange;
 
 #[async_trait]
-impl ExchangeClient for NotYetImplementedExchange {
+impl ExchangeClient for NoWalletExchange {
     fn venue_name(&self) -> &str {
         "pumpfun"
     }
 
     async fn current_price(&self, _symbol: &Symbol) -> Result<Decimal, PortError> {
         Err(PortError::Rejected(
-            "real Solana trade execution is not yet implemented - see README".to_string(),
+            "real-time Solana price monitoring is not yet implemented - see README".to_string(),
+        ))
+    }
+
+    async fn submit_buy_by_amount(&self, _symbol: &Symbol, _quote_amount: Decimal) -> Result<FilledBuy, PortError> {
+        Err(PortError::Rejected(
+            "no wallet configured (SOLANA_PRIVATE_KEY not set) - see execution module docs".to_string(),
         ))
     }
 
     async fn submit_order(&self, _order: Order) -> Result<Order, PortError> {
         Err(PortError::Rejected(
-            "real Solana trade execution is not yet implemented - see README".to_string(),
+            "no wallet configured (SOLANA_PRIVATE_KEY not set) - see execution module docs".to_string(),
         ))
     }
 }
@@ -3155,6 +3230,13 @@ pub fn load_wallet() -> Result<Keypair, String> {
 
     Keypair::try_from(bytes.as_slice())
         .map_err(|e| format!("SOLANA_PRIVATE_KEY did not decode to a valid keypair: {e}"))
+}
+
+/// Convenience for callers that just want to log/display the wallet's
+/// address without depending on `solana_sdk::signer::Signer` themselves
+/// - keeps that dependency an implementation detail of this crate.
+pub fn wallet_pubkey_string(wallet: &Keypair) -> String {
+    wallet.pubkey().to_string()
 }
 
 /// A trade to submit through PumpPortal's Local Transaction API.
@@ -3309,6 +3391,611 @@ async fn broadcast(http: &reqwest::Client, rpc_url: &str, signed_bytes: &[u8]) -
         .ok_or_else(|| format!("RPC response had no result field: {response_json}"))
 }
 
+--- ./crates/adapters/pumpfun/src/exchange_client.rs ---
+//! A real `ExchangeClient` for PumpPortal. Buy and sell execution both
+//! work through `execution::execute_trade` - a buy spends a SOL amount,
+//! a sell offloads a known token quantity, and neither needs us to know
+//! a price beforehand, since PumpPortal's bonding-curve math happens on
+//! their side. See `execution`'s module doc comment for the signing-code
+//! verification caveat before running this with real funds.
+//!
+//! `current_price` is backed by `price_feed::fetch_price` (Jupiter's
+//! Price API v3, converted to SOL-denominated terms to match
+//! `entry_price` elsewhere in this codebase - see that module's doc
+//! comment for why the conversion matters). This is a real,
+//! well-corroborated integration, but it's an external network
+//! dependency that returns "no data yet" for very fresh tokens - a
+//! position can briefly have no way to check its exit condition right
+//! after buying, until the token gets indexed.
+//!
+//! **Confirming a buy landed:** after broadcasting, this polls
+//! `getSignatureStatuses` until the transaction is confirmed (or errors
+//! out), then reads the resulting balance via `getTokenAccountsByOwner`.
+//! Both are foundational, long-stable pieces of Solana's JSON-RPC wire
+//! protocol - not a Rust crate's internal API - so these carry
+//! meaningfully less version-churn risk than the signing code in
+//! `execution.rs` does, but they're still unverified by an actual RPC
+//! call in this environment (no network access here). Sanity-check
+//! against a real RPC response shape on first run.
+
+use crate::execution::{execute_trade, TradeAction, TradeRequest};
+use crate::price_feed;
+use async_trait::async_trait;
+use ben_snipes_domain::{FilledBuy, Order, OrderSide, OrderStatus, Symbol};
+use ben_snipes_ports::{ExchangeClient, PortError};
+use rust_decimal::Decimal;
+use solana_sdk::signer::keypair::Keypair;
+use solana_sdk::signer::Signer;
+use std::time::Duration;
+
+/// How many times to poll for confirmation before giving up. At ~1s per
+/// attempt this is roughly a 30 second timeout, which is generous for
+/// Solana's typical confirmation times but not unbounded - a genuinely
+/// stuck transaction shouldn't hang the bot forever.
+const CONFIRMATION_ATTEMPTS: u32 = 30;
+const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+pub struct PumpPortalExchangeClient {
+    http: reqwest::Client,
+    wallet: Keypair,
+    rpc_url: String,
+    slippage_percent: u32,
+    priority_fee_sol: Decimal,
+}
+
+impl PumpPortalExchangeClient {
+    pub fn new(wallet: Keypair, rpc_url: impl Into<String>, slippage_percent: u32, priority_fee_sol: Decimal) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            wallet,
+            rpc_url: rpc_url.into(),
+            slippage_percent,
+            priority_fee_sol,
+        }
+    }
+
+    async fn wait_for_confirmation(&self, signature: &str) -> Result<(), PortError> {
+        for _ in 0..CONFIRMATION_ATTEMPTS {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSignatureStatuses",
+                "params": [[signature], { "searchTransactionHistory": true }],
+            });
+
+            let response = self
+                .http
+                .post(&self.rpc_url)
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .map_err(|e| PortError::Rejected(format!("confirmation check failed: {e}")))?;
+
+            let json: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| PortError::Rejected(format!("failed to parse confirmation response: {e}")))?;
+
+            match json.pointer("/result/value/0") {
+                Some(status) if !status.is_null() => {
+                    if let Some(err) = status.get("err") {
+                        if !err.is_null() {
+                            return Err(PortError::Rejected(format!("transaction failed on-chain: {err}")));
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => {
+                    // Not yet visible to this RPC node - keep polling.
+                }
+            }
+
+            tokio::time::sleep(CONFIRMATION_POLL_INTERVAL).await;
+        }
+
+        Err(PortError::Rejected(format!(
+            "transaction {signature} not confirmed within {CONFIRMATION_ATTEMPTS} attempts"
+        )))
+    }
+
+    /// Reads the wallet's balance of `mint` via `getTokenAccountsByOwner`.
+    /// Prefers `uiAmountString` (avoids float round-tripping for the
+    /// balance figure) and falls back to the float `uiAmount` field only
+    /// if the string form isn't present.
+    async fn token_balance(&self, mint: &str) -> Result<Decimal, PortError> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                self.wallet.pubkey().to_string(),
+                { "mint": mint },
+                { "encoding": "jsonParsed" },
+            ],
+        });
+
+        let response = self
+            .http
+            .post(&self.rpc_url)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| PortError::Rejected(format!("balance check failed: {e}")))?;
+
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| PortError::Rejected(format!("failed to parse balance response: {e}")))?;
+
+        let token_amount = json.pointer("/result/value/0/account/data/parsed/info/tokenAmount");
+
+        if let Some(s) = token_amount.and_then(|v| v.get("uiAmountString")).and_then(|v| v.as_str()) {
+            return s
+                .parse::<Decimal>()
+                .map_err(|e| PortError::Rejected(format!("could not parse token balance '{s}': {e}")));
+        }
+
+        let ui_amount = token_amount
+            .and_then(|v| v.get("uiAmount"))
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| {
+                PortError::Rejected(
+                    "no token account balance found - the buy may not have landed yet".to_string(),
+                )
+            })?;
+
+        Decimal::try_from(ui_amount).map_err(|e| PortError::Rejected(format!("balance value was not a valid decimal: {e}")))
+    }
+}
+
+#[async_trait]
+impl ExchangeClient for PumpPortalExchangeClient {
+    fn venue_name(&self) -> &str {
+        "pumpfun"
+    }
+
+    async fn current_price(&self, symbol: &Symbol) -> Result<Decimal, PortError> {
+        price_feed::fetch_price(&self.http, symbol.as_str())
+            .await
+            .map_err(PortError::Rejected)
+    }
+
+    async fn submit_buy_by_amount(&self, symbol: &Symbol, quote_amount: Decimal) -> Result<FilledBuy, PortError> {
+        let request = TradeRequest {
+            action: TradeAction::Buy,
+            mint: symbol.as_str().to_string(),
+            amount: quote_amount.to_string(),
+            slippage_percent: self.slippage_percent,
+            priority_fee_sol: self.priority_fee_sol,
+        };
+
+        let signature = execute_trade(&self.http, &self.wallet, &self.rpc_url, &request)
+            .await
+            .map_err(PortError::Rejected)?;
+
+        self.wait_for_confirmation(&signature).await?;
+
+        let quantity = self.token_balance(symbol.as_str()).await?;
+        if quantity <= Decimal::ZERO {
+            return Err(PortError::Rejected(
+                "buy confirmed on-chain but resulting token balance was zero or unreadable".to_string(),
+            ));
+        }
+
+        Ok(FilledBuy {
+            quantity,
+            entry_price: quote_amount / quantity,
+        })
+    }
+
+    async fn submit_order(&self, order: Order) -> Result<Order, PortError> {
+        if order.side != OrderSide::Sell {
+            return Err(PortError::Rejected(
+                "PumpPortalExchangeClient buys go through submit_buy_by_amount, not submit_order".to_string(),
+            ));
+        }
+
+        let request = TradeRequest {
+            action: TradeAction::Sell,
+            mint: order.symbol.as_str().to_string(),
+            amount: order.quantity.to_string(),
+            slippage_percent: self.slippage_percent,
+            priority_fee_sol: self.priority_fee_sol,
+        };
+
+        let signature = execute_trade(&self.http, &self.wallet, &self.rpc_url, &request)
+            .await
+            .map_err(PortError::Rejected)?;
+
+        self.wait_for_confirmation(&signature).await?;
+
+        let mut filled = order;
+        filled.status = OrderStatus::Filled;
+        Ok(filled)
+    }
+}
+
+--- ./crates/adapters/pumpfun/src/safety_checker.rs ---
+//! Real `TokenSafetyChecker` for Solana via RugCheck (`api.rugcheck.xyz`).
+//!
+//! **Confidence varies significantly by field, and that's reflected in
+//! how conservatively each one defaults.** `mintAuthority` /
+//! `freezeAuthority` are confirmed - independently corroborated by both
+//! an unofficial API wrapper's documented field list and an AI-skill
+//! doc that explicitly describes `token.mintAuthority != null` as the
+//! "can still mint" signal - so `is_mintable` and half of
+//! `ownership_renounced` rest on solid ground. Liquidity-lock detection
+//! (via the `lockers` field) and sell-tax are much less certain: RugCheck
+//! doesn't appear to reliably expose a sell-tax figure at all (it's
+//! fundamentally a different kind of check - authority/liquidity/holder
+//! analysis, not a sell simulation), so `sell_tax_bps` here is **always
+//! 0, which means unverified, not confirmed-safe.** If accurate sell-tax
+//! detection matters for your risk tolerance, that needs a real sell
+//! simulation as a separate data source - don't read a `0` from this
+//! checker as "no tax", read it as "this checker doesn't know."
+//!
+//! **A real limitation worth being direct about:** if `mintAuthority`/
+//! `freezeAuthority` turn out not to be the actual field names RugCheck
+//! uses (moderate but not total confidence - see above), those fields
+//! deserialize to `None` the same way a genuinely-renounced authority
+//! would, and `is_mintable`/`ownership_renounced` would silently read as
+//! "safe" for every token. That's fail-*open*, the opposite of this
+//! codebase's standing principle. The one thing this code *can* check at
+//! runtime - whether the `token` sub-object exists at all - is checked
+//! below and treated as "not enough information" (`None`) if it's
+//! missing entirely, which catches a badly-wrong response shape. It
+//! cannot catch "the token object is there but these two specific key
+//! names are wrong." **Verify `mintAuthority`/`freezeAuthority` against
+//! a real RugCheck response before trusting this for real funds** - the
+//! same category of caveat as the solana-sdk signing code, for the same
+//! reason: unverified assumption, safety-critical consequence if wrong.
+
+use async_trait::async_trait;
+use ben_snipes_domain::{SafetyReport, Symbol};
+use ben_snipes_ports::{PortError, TokenSafetyChecker};
+use serde::Deserialize;
+use serde_json::Value;
+
+const REPORT_URL: &str = "https://api.rugcheck.xyz/v1/tokens";
+
+#[derive(Debug, Default, Deserialize)]
+struct RugCheckReport {
+    #[serde(default)]
+    token: Option<TokenInfo>,
+    /// Present when RugCheck has directly flagged the token as a
+    /// confirmed rug - if this is `true`, nothing else in the report
+    /// matters.
+    #[serde(default)]
+    rugged: bool,
+    /// Left as a raw `Value` rather than a typed field - only its
+    /// presence/non-emptiness is used (see module docs on why the exact
+    /// lock-percentage shape isn't confidently known).
+    #[serde(default)]
+    lockers: Option<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TokenInfo {
+    #[serde(default, rename = "mintAuthority")]
+    mint_authority: Option<Value>,
+    #[serde(default, rename = "freezeAuthority")]
+    freeze_authority: Option<Value>,
+}
+
+pub struct RugCheckSafetyChecker {
+    http: reqwest::Client,
+}
+
+impl RugCheckSafetyChecker {
+    pub fn new() -> Self {
+        Self {
+            http: reqwest::Client::new(),
+        }
+    }
+}
+
+impl Default for RugCheckSafetyChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl TokenSafetyChecker for RugCheckSafetyChecker {
+    async fn assess(&self, symbol: &Symbol) -> Result<Option<SafetyReport>, PortError> {
+        let url = format!("{REPORT_URL}/{}/report", symbol.as_str());
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .map_err(|e| PortError::Network {
+                venue: "rugcheck".to_string(),
+                source: Box::new(e),
+            })?;
+
+        if !response.status().is_success() {
+            // A brand-new token may not be indexed by RugCheck yet -
+            // treat any non-success as "not enough information", not a
+            // hard failure.
+            return Ok(None);
+        }
+
+        let report: RugCheckReport = response.json().await.map_err(|e| PortError::MalformedResponse {
+            venue: "rugcheck".to_string(),
+            reason: e.to_string(),
+        })?;
+
+        if report.rugged {
+            return Ok(Some(SafetyReport {
+                sell_tax_bps: 0,
+                ownership_renounced: false,
+                liquidity_locked: false,
+                is_mintable: true,
+            }));
+        }
+
+        let Some(token) = report.token else {
+            // The whole `token` sub-object is missing - a much stronger
+            // signal something is wrong with the assumed response shape
+            // than any individual field being absent. Treat as "not
+            // enough information" rather than guessing.
+            return Ok(None);
+        };
+
+        // serde maps both an absent field and an explicit JSON `null`
+        // to `None` for an `Option<Value>` field, so `is_some()` alone
+        // correctly distinguishes "authority present" (any non-null
+        // value, typically a pubkey string) from "renounced/absent" -
+        // assuming the field names themselves are right. See the
+        // module doc comment for the residual risk if they're not.
+        let is_mintable = token.mint_authority.is_some();
+        let freeze_authority_present = token.freeze_authority.is_some();
+        let ownership_renounced = !is_mintable && !freeze_authority_present;
+
+        // Best-effort: non-empty lockers array/object is treated as
+        // "some liquidity locking exists". See module docs - this is
+        // the least-confident field mapping here.
+        let liquidity_locked = match &report.lockers {
+            Some(Value::Array(arr)) => !arr.is_empty(),
+            Some(Value::Object(obj)) => !obj.is_empty(),
+            _ => false,
+        };
+
+        Ok(Some(SafetyReport {
+            // Always 0 - see module docs. This is "unverified", not
+            // "confirmed zero tax".
+            sell_tax_bps: 0,
+            ownership_renounced,
+            liquidity_locked,
+            is_mintable,
+        }))
+    }
+}
+
+--- ./crates/adapters/pumpfun/src/price_feed.rs ---
+//! Live price lookups via Jupiter's Price API v3
+//! (`lite-api.jup.ag/price/v3`), used by `PumpPortalExchangeClient::current_price`.
+//!
+//! Verified against Jupiter's own developer docs at the time of
+//! writing, including a literal example response - this is the
+//! best-confirmed of the three new external integrations added this
+//! round. One thing worth flagging anyway: **the older
+//! `quote-api.jup.ag/v6` endpoints (which several third-party guides,
+//! including one shared during this project's development, still
+//! reference) were retired on 2025-10-01.** If a future docs check
+//! shows `price/v3` has similarly moved on, that's the first thing to
+//! re-verify here.
+//!
+//! Uses the keyless `lite-api.jup.ag` host (rate-limited but free) by
+//! default. For production volume, `api.jup.ag` with an `x-api-key`
+//! header is the documented higher-throughput option - not wired in
+//! here, since a single default is enough to get this working and a
+//! key can be layered on without changing the response-parsing logic.
+//!
+//! **Unit note, easy to get wrong:** Jupiter's Price API returns
+//! USD-denominated prices. `Position::entry_price` throughout this
+//! codebase is SOL-denominated (`submit_buy_by_amount` computes it as
+//! `quote_amount spent in SOL / quantity received`), because that's
+//! what `AcquisitionEngine.position_size` and PumpPortal's own trade
+//! API are denominated in. Returning a raw USD price here would silently
+//! compare against a SOL-denominated take-profit/stop-loss target -
+//! wrong by roughly the SOL/USD exchange rate, not a rounding error.
+//! `fetch_price` converts to SOL terms internally (by also fetching
+//! SOL's own USD price in the same batched call) specifically so every
+//! caller gets a value in the same unit `Position` already uses.
+
+use rust_decimal::Decimal;
+use serde::Deserialize;
+use std::collections::HashMap;
+
+const PRICE_API_URL: &str = "https://lite-api.jup.ag/price/v3";
+
+/// Wrapped SOL's mint address - this exact value appears directly in
+/// Jupiter's own documented example response, so it's about as
+/// verified as a constant can be.
+const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+#[derive(Debug, Deserialize)]
+struct PriceEntry {
+    #[serde(rename = "usdPrice")]
+    usd_price: f64,
+}
+
+/// Fetches the current price of `mint`, denominated in SOL (see the
+/// module doc comment for why, not USD). Returns an error if either
+/// mint has no price data (an extremely fresh pump.fun token, for
+/// instance, may not be indexed here yet even if it's tradable) -
+/// callers should treat that as "not enough information", the same way
+/// `MetricsProvider::metrics` returning `None` is handled elsewhere in
+/// this codebase.
+pub async fn fetch_price(http: &reqwest::Client, mint: &str) -> Result<Decimal, String> {
+    // Batched into one call - Jupiter's ids param takes a comma-separated
+    // list, so this is one request, not two.
+    let url = format!("{PRICE_API_URL}?ids={mint},{SOL_MINT}");
+
+    let response = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Jupiter price request failed: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("Jupiter price API returned {status}: {text}"));
+    }
+
+    let body: HashMap<String, PriceEntry> = response
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse Jupiter price response: {e}"))?;
+
+    let token_usd = body
+        .get(mint)
+        .map(|e| e.usd_price)
+        .ok_or_else(|| format!("Jupiter has no price data for {mint} yet"))?;
+
+    let sol_usd = body
+        .get(SOL_MINT)
+        .map(|e| e.usd_price)
+        .ok_or_else(|| "Jupiter had no price data for wrapped SOL - cannot convert to SOL terms".to_string())?;
+
+    if sol_usd <= 0.0 {
+        return Err("Jupiter returned a non-positive SOL price, cannot convert".to_string());
+    }
+
+    let price_in_sol = token_usd / sol_usd;
+
+    Decimal::try_from(price_in_sol).map_err(|e| format!("converted price was not a valid decimal: {e}"))
+}
+
+--- ./crates/adapters/pumpfun/src/metrics_provider.rs ---
+//! Real `MetricsProvider` for Solana tokens via DexScreener's
+//! single-token lookup endpoint (`/latest/dex/tokens/<address>`) - free,
+//! keyless, and well-corroborated across independent sources at the
+//! time of writing.
+//!
+//! **This is a different endpoint from the one this project deliberately
+//! avoided for listing detection.** The new-pairs/discovery endpoint
+//! that capped out at ~30 results with no real pagination is a
+//! different concern (a live firehose) from this one (a single lookup
+//! by an address you already have) - there's no pagination problem to
+//! begin with when you're asking about one specific token.
+
+use async_trait::async_trait;
+use ben_snipes_domain::{ListingMetrics, Symbol};
+use ben_snipes_ports::{MetricsProvider, PortError};
+use rust_decimal::Decimal;
+use serde::Deserialize;
+
+const TOKENS_URL: &str = "https://api.dexscreener.com/latest/dex/tokens";
+
+#[derive(Debug, Deserialize)]
+struct TokensResponse {
+    #[serde(default)]
+    pairs: Option<Vec<PairInfo>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PairInfo {
+    #[serde(default)]
+    volume: Option<VolumeInfo>,
+    #[serde(default, rename = "marketCap")]
+    market_cap: Option<f64>,
+    #[serde(default)]
+    fdv: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VolumeInfo {
+    #[serde(default, rename = "h24")]
+    h24: Option<f64>,
+}
+
+pub struct DexScreenerMetricsProvider {
+    http: reqwest::Client,
+}
+
+impl DexScreenerMetricsProvider {
+    pub fn new() -> Self {
+        Self {
+            http: reqwest::Client::new(),
+        }
+    }
+}
+
+impl Default for DexScreenerMetricsProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl MetricsProvider for DexScreenerMetricsProvider {
+    async fn metrics(&self, symbol: &Symbol) -> Result<Option<ListingMetrics>, PortError> {
+        let url = format!("{TOKENS_URL}/{}", symbol.as_str());
+
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| PortError::Network {
+                venue: "dexscreener".to_string(),
+                source: Box::new(e),
+            })?;
+
+        if !response.status().is_success() {
+            // A 404-shaped "no pairs yet" is expected for a brand-new
+            // token, not a hard failure - treat any non-success the
+            // same way: not enough information yet.
+            return Ok(None);
+        }
+
+        let body: TokensResponse = response.json().await.map_err(|e| PortError::MalformedResponse {
+            venue: "dexscreener".to_string(),
+            reason: e.to_string(),
+        })?;
+
+        let Some(pairs) = body.pairs else {
+            return Ok(None);
+        };
+
+        // A token can have multiple pairs (different pools/DEXes) -
+        // take the one with the most volume, since that's the most
+        // representative of "is there a real market here".
+        let Some(best) = pairs.iter().max_by(|a, b| {
+            let a_vol = a.volume.as_ref().and_then(|v| v.h24).unwrap_or(0.0);
+            let b_vol = b.volume.as_ref().and_then(|v| v.h24).unwrap_or(0.0);
+            a_vol.partial_cmp(&b_vol).unwrap_or(std::cmp::Ordering::Equal)
+        }) else {
+            return Ok(None);
+        };
+
+        let volume_24h = best.volume.as_ref().and_then(|v| v.h24).unwrap_or(0.0);
+        // Prefer marketCap; DexScreener sometimes only populates fdv
+        // (fully-diluted valuation) for very new tokens before
+        // circulating-supply data is available.
+        let market_cap = best.market_cap.or(best.fdv).unwrap_or(0.0);
+
+        let volume_24h = Decimal::try_from(volume_24h).map_err(|e| PortError::MalformedResponse {
+            venue: "dexscreener".to_string(),
+            reason: format!("volume was not a valid decimal: {e}"),
+        })?;
+        let market_cap = Decimal::try_from(market_cap).map_err(|e| PortError::MalformedResponse {
+            venue: "dexscreener".to_string(),
+            reason: format!("market cap was not a valid decimal: {e}"),
+        })?;
+
+        Ok(Some(ListingMetrics { volume_24h, market_cap }))
+    }
+}
+
 --- ./crates/adapters/pumpfun/Cargo.toml ---
 [package]
 name = "ben_snipes-adapter-pumpfun"
@@ -3367,7 +4054,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 use async_trait::async_trait;
 use ben_snipes_adapter_ws_support::connect_with_backoff;
-use ben_snipes_domain::{Chain, DomainError, Listing, ListingMetrics, Order, SafetyReport, Symbol, Venue, VenueKind};
+use ben_snipes_domain::{
+    Chain, DomainError, FilledBuy, Listing, ListingMetrics, Order, SafetyReport, Symbol, Venue,
+    VenueKind,
+};
 use ben_snipes_ports::{
     ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError, TokenSafetyChecker,
 };
@@ -3580,6 +4270,12 @@ impl ExchangeClient for NotYetImplementedExchange {
         ))
     }
 
+    async fn submit_buy_by_amount(&self, _symbol: &Symbol, _quote_amount: Decimal) -> Result<FilledBuy, PortError> {
+        Err(PortError::Rejected(
+            "real EVM trade execution is not yet implemented - see README".to_string(),
+        ))
+    }
+
     async fn submit_order(&self, _order: Order) -> Result<Order, PortError> {
         Err(PortError::Rejected(
             "real EVM trade execution is not yet implemented - see README".to_string(),
@@ -3635,14 +4331,24 @@ tracing = { workspace = true }
 //!
 //! CEX support has been deliberately dropped from this binary - new CEX
 //! listings are too rare and too slow relative to on-chain launches to
-//! be worth the surface area. Detection now runs on two real sources:
+//! be worth the surface area. Detection runs on two real sources:
 //! PumpPortal (Solana, via `ben_snipes-adapter-pumpfun`) and, per
 //! configured chain, a direct EVM factory-log subscription (via
-//! `ben_snipes-adapter-evm-onchain`). Neither can execute real trades
-//! yet - see each crate's docs and this file's `build_venues` for why
-//! that's a safe default rather than an oversight. A `dex-mock` demo
-//! venue is kept alongside them so `cargo run` still demonstrates the
-//! full buy -> hold -> exit pipeline end to end with synthetic data.
+//! `ben_snipes-adapter-evm-onchain`).
+//!
+//! **The Solana pipeline is now fully wired end to end**: real
+//! detection, real volume filtering (DexScreener), a real safety gate
+//! (RugCheck), a real cross-source dedup ledger, and - if
+//! `SOLANA_PRIVATE_KEY` is set - real buy/sell execution. That means
+//! this can autonomously spend real funds the moment a wallet is
+//! configured. Every piece added this way carries its own confidence
+//! caveat in its module docs (`execution.rs` for signing, `safety_checker.rs`
+//! for RugCheck's field-mapping risk, `price_feed.rs` for the
+//! SOL-denomination fix) - read them before funding a wallet, not after.
+//! EVM execution hasn't been built yet. A `dex-mock` demo venue is kept
+//! alongside both so `cargo run` still demonstrates the full pipeline
+//! end to end with synthetic data, independent of any real network
+//! access or funded wallet.
 
 use ben_snipes_adapter_dex_mock::{MockDexClient, MockDexSource};
 use ben_snipes_adapter_evm_onchain::{
@@ -3650,8 +4356,8 @@ use ben_snipes_adapter_evm_onchain::{
     NotYetImplementedMetrics as EvmNotYetImplementedMetrics,
 };
 use ben_snipes_adapter_pumpfun::{
-    NotYetImplementedExchange as SolNotYetImplementedExchange,
-    NotYetImplementedMetrics as SolNotYetImplementedMetrics, PumpPortalSource,
+    load_wallet, wallet_pubkey_string, DexScreenerMetricsProvider, NoWalletExchange,
+    PumpPortalExchangeClient, PumpPortalSource, RugCheckSafetyChecker,
 };
 use ben_snipes_adapter_statefile::{FileAcquisitionLedger, StatefileStore};
 use ben_snipes_application::{AcquisitionEngine, NewListingDetector, PositionManager, SafetyGate};
@@ -3660,7 +4366,7 @@ use ben_snipes_domain::{
     AcquisitionCriteria, ListingMetrics, Position, ProfitTarget, SafetyCriteria, SafetyReport,
     StopLoss,
 };
-use ben_snipes_ports::{AcquisitionLedger, ListingSource};
+use ben_snipes_ports::{AcquisitionLedger, ExchangeClient, ListingSource};
 use rust_decimal::Decimal;
 use std::fmt::Display;
 use std::sync::Arc;
@@ -3754,23 +4460,46 @@ async fn build_venues(
         PumpPortalSource::spawn(config.solana.pumpportal_ws_url.clone()),
         "solana pumpportal source",
     );
-    // No MetricsProvider or safety data exists for pump.fun tokens yet,
-    // so this engine will never actually buy - see
-    // ben_snipes-adapter-pumpfun's docs for why that's correct, not a
-    // bug. It still runs the full detect -> ledger-dedup pipeline, so
-    // wiring in real metrics/execution later is a drop-in swap.
+
+    // Wallet is optional at startup, deliberately: absence of a key
+    // should disable trading, not crash a bot that's otherwise perfectly
+    // capable of running in detection-only mode. See execution.rs for
+    // why this is the single highest-risk code path in the project if a
+    // wallet *is* configured.
+    let solana_exchange: Arc<dyn ExchangeClient> = match load_wallet() {
+        Ok(wallet) => {
+            info!(pubkey = %wallet_pubkey_string(&wallet), "solana wallet loaded - buy/sell execution is live");
+            Arc::new(PumpPortalExchangeClient::new(
+                wallet,
+                config.solana.rpc_url.clone(),
+                config.solana.slippage_percent,
+                config.solana.priority_fee_sol,
+            ))
+        }
+        Err(reason) => {
+            info!(reason = %reason, "no solana wallet configured - running pumpfun in detection-only mode");
+            Arc::new(NoWalletExchange)
+        }
+    };
+
+    // Real, network-backed data sources - see each crate's module doc
+    // comments for confidence caveats on RugCheck's field mapping and
+    // Jupiter's SOL-denomination conversion specifically.
+    let solana_metrics = Arc::new(DexScreenerMetricsProvider::new());
+    let solana_safety_gate = SafetyGate::new(Arc::new(RugCheckSafetyChecker::new()), risk.safety_criteria);
+
     venues.push(VenueHandle {
         acquisition: AcquisitionEngine::new(
-            Arc::new(SolNotYetImplementedMetrics),
-            Arc::new(SolNotYetImplementedExchange),
+            solana_metrics,
+            solana_exchange.clone(),
             ledger.clone(),
             risk.criteria,
             risk.take_profit,
             risk.stop_loss,
             config.risk.max_position_size,
-            None,
+            Some(solana_safety_gate),
         ),
-        position_manager: PositionManager::new(Arc::new(SolNotYetImplementedExchange)),
+        position_manager: PositionManager::new(solana_exchange),
         source: Box::new(pumpfun_source),
     });
 

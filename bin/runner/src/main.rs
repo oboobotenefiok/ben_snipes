@@ -7,13 +7,21 @@
 //! be worth the surface area. Detection runs on two real sources:
 //! PumpPortal (Solana, via `ben_snipes-adapter-pumpfun`) and, per
 //! configured chain, a direct EVM factory-log subscription (via
-//! `ben_snipes-adapter-evm-onchain`). Solana buy/sell execution is real
-//! when `SOLANA_PRIVATE_KEY` is set (falls back to detection-only
-//! otherwise, see `build_venues` below); EVM execution hasn't been
-//! built yet. A `dex-mock` demo venue is kept alongside both so `cargo
-//! run` still demonstrates the full buy -> hold -> exit pipeline end to
-//! end with synthetic data, independent of any real network access or
-//! funded wallet.
+//! `ben_snipes-adapter-evm-onchain`).
+//!
+//! **The Solana pipeline is now fully wired end to end**: real
+//! detection, real volume filtering (DexScreener), a real safety gate
+//! (RugCheck), a real cross-source dedup ledger, and - if
+//! `SOLANA_PRIVATE_KEY` is set - real buy/sell execution. That means
+//! this can autonomously spend real funds the moment a wallet is
+//! configured. Every piece added this way carries its own confidence
+//! caveat in its module docs (`execution.rs` for signing, `safety_checker.rs`
+//! for RugCheck's field-mapping risk, `price_feed.rs` for the
+//! SOL-denomination fix) - read them before funding a wallet, not after.
+//! EVM execution hasn't been built yet. A `dex-mock` demo venue is kept
+//! alongside both so `cargo run` still demonstrates the full pipeline
+//! end to end with synthetic data, independent of any real network
+//! access or funded wallet.
 
 use ben_snipes_adapter_dex_mock::{MockDexClient, MockDexSource};
 use ben_snipes_adapter_evm_onchain::{
@@ -21,9 +29,8 @@ use ben_snipes_adapter_evm_onchain::{
     NotYetImplementedMetrics as EvmNotYetImplementedMetrics,
 };
 use ben_snipes_adapter_pumpfun::{
-    load_wallet, wallet_pubkey_string, NoWalletExchange,
-    NotYetImplementedMetrics as SolNotYetImplementedMetrics, PumpPortalExchangeClient,
-    PumpPortalSource,
+    load_wallet, wallet_pubkey_string, DexScreenerMetricsProvider, NoWalletExchange,
+    PumpPortalExchangeClient, PumpPortalSource, RugCheckSafetyChecker,
 };
 use ben_snipes_adapter_statefile::{FileAcquisitionLedger, StatefileStore};
 use ben_snipes_application::{AcquisitionEngine, NewListingDetector, PositionManager, SafetyGate};
@@ -148,22 +155,22 @@ async fn build_venues(
         }
     };
 
-    // No MetricsProvider exists for pump.fun tokens yet, so this engine
-    // will never actually buy regardless of whether a wallet is
-    // configured - see ben_snipes-adapter-pumpfun's docs for why that's
-    // correct, not a bug. It still runs the full detect ->
-    // ledger-dedup pipeline, so wiring in real metrics later (the next
-    // step) makes buying live with zero changes here.
+    // Real, network-backed data sources - see each crate's module doc
+    // comments for confidence caveats on RugCheck's field mapping and
+    // Jupiter's SOL-denomination conversion specifically.
+    let solana_metrics = Arc::new(DexScreenerMetricsProvider::new());
+    let solana_safety_gate = SafetyGate::new(Arc::new(RugCheckSafetyChecker::new()), risk.safety_criteria);
+
     venues.push(VenueHandle {
         acquisition: AcquisitionEngine::new(
-            Arc::new(SolNotYetImplementedMetrics),
+            solana_metrics,
             solana_exchange.clone(),
             ledger.clone(),
             risk.criteria,
             risk.take_profit,
             risk.stop_loss,
             config.risk.max_position_size,
-            None,
+            Some(solana_safety_gate),
         ),
         position_manager: PositionManager::new(solana_exchange),
         source: Box::new(pumpfun_source),

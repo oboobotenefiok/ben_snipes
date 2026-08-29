@@ -41,8 +41,13 @@ use tracing::{debug, warn};
 
 pub mod exchange_client;
 pub mod execution;
+pub mod metrics_provider;
+pub mod price_feed;
+pub mod safety_checker;
 pub use exchange_client::PumpPortalExchangeClient;
 pub use execution::{execute_trade, load_wallet, wallet_pubkey_string, TradeAction, TradeRequest};
+pub use metrics_provider::DexScreenerMetricsProvider;
+pub use safety_checker::RugCheckSafetyChecker;
 
 pub const DEFAULT_WS_URL: &str = "wss://pumpportal.fun/api/data";
 

@@ -8,12 +8,15 @@ on-chain launches to be worth the surface area for a bot whose whole
 edge is being early. See "Automation & execution platforms" below for
 how buys/sells are meant to actually get executed.
 
-**Status: real detection for Solana + EVM; real buy/sell execution for
-Solana when a wallet is configured.** See "Automation & execution
-platforms" for what "real" means here and its caveats, and "Not yet
-implemented" for what's still missing (most importantly: a live price
-feed, without which nothing actually buys yet regardless of execution
-being wired up).
+**Status: the Solana pipeline is fully wired end to end.** Real
+detection, real volume filtering (DexScreener), a real safety gate
+(RugCheck), a real cross-source dedup ledger, and - when
+`SOLANA_PRIVATE_KEY` is set - real buy/sell execution. **This means it
+can autonomously spend real funds.** See "Automation & execution
+platforms" for exactly what's verified vs. best-effort in each piece,
+and read every module doc comment it points to before funding a
+wallet. EVM execution is detection-only still - see "Not yet
+implemented."
 
 ## Architecture
 
@@ -36,11 +39,13 @@ crates/adapters/
                       file-backed with atomic temp-file+rename writes.
   ws-support/          shared reconnect-with-backoff helper for the two
                       websocket-backed real adapters below.
-  pumpfun/             REAL Solana ListingSource via PumpPortal's
-                      subscribeNewToken feed, plus REAL buy/sell
-                      execution via their Local Transaction API
-                      (execution.rs + exchange_client.rs) - falls back
-                      to detection-only if no wallet is configured.
+  pumpfun/             REAL Solana pipeline, five modules:
+                      listing detection (PumpPortal websocket),
+                      execution.rs (signing/broadcast) +
+                      exchange_client.rs (buy/sell, falls back to
+                      detection-only with no wallet), metrics_provider.rs
+                      (DexScreener volume), safety_checker.rs (RugCheck),
+                      price_feed.rs (Jupiter price, SOL-denominated).
   evm-onchain/         REAL EVM ListingSource: subscribes directly to a
                       DEX factory's pair-creation logs over eth_subscribe.
                       Chain/factory/event-agnostic, configured per chain.
@@ -185,16 +190,60 @@ matched what the venue needed. Selling stays quantity-based
 (`submit_order`) since by the time you're exiting, the quantity is
 already known - it's the position you're holding.
 
-**What's still genuinely missing, and why it matters:** even with real
-execution wired in, nothing buys yet - `MetricsProvider` for Solana
-still always returns `None` (no live volume source exists), which
-makes `AcquisitionEngine` correctly refuse to buy anything. And even if
-that's fixed, `PositionManager` still needs `current_price()` to decide
-*when* to exit, which `PumpPortalExchangeClient` still can't provide -
-that needs either bonding-curve account reads or a live trade-stream
-subscription, neither built yet. These two gaps turn out to be the same
-underlying need (real-time per-token price/volume data), so they're
-naturally one future piece of work, not two.
+**Volume filtering, safety gate, and price monitoring are now real too -
+at three different confidence levels, and it matters which is which:**
+
+- **`current_price` (Jupiter Price API v3, `price_feed.rs`) - high
+  confidence.** Verified against a literal example response in Jupiter's
+  own docs. One easy-to-miss detail already handled: Jupiter's prices
+  are USD-denominated, but `entry_price` throughout this codebase is
+  SOL-denominated (it comes from `quote_amount spent in SOL / quantity
+  received`). Comparing a raw USD price against a SOL-denominated
+  take-profit/stop-loss target would be wrong by roughly the SOL/USD
+  exchange rate, not a rounding error - `fetch_price` converts by
+  fetching SOL's own price in the same batched call.
+- **`MetricsProvider` (DexScreener single-token lookup,
+  `metrics_provider.rs`) - high confidence.** Free, keyless, well
+  corroborated. Note this is a *different* DexScreener endpoint than the
+  one this project deliberately avoided for detection - that was the
+  paginated new-pairs firehose; this is a single lookup by an address
+  you already have, which was never the endpoint with the pagination
+  problem.
+- **`TokenSafetyChecker` (RugCheck, `safety_checker.rs`) - mixed
+  confidence, and the module doc comment is explicit about which parts.**
+  `mintAuthority`/`freezeAuthority` field names are independently
+  corroborated by two sources. Liquidity-lock detection is best-effort.
+  **Sell-tax detection is not meaningfully implemented** - RugCheck
+  doesn't appear to expose it, so `sell_tax_bps` is always `0`, which
+  means *unverified*, not confirmed-safe. There's also a residual risk
+  worth naming directly: if the two authority field names turn out to be
+  wrong, they'd silently read as "renounced" (safe) rather than erroring
+  - fail-*open*, the opposite of this codebase's usual default. One
+  fail-closed guard is in place (a missing `token` sub-object entirely
+  aborts the assessment), but it can't catch a merely-wrong field name
+  within an otherwise-present object. Verify against a live response
+  before trusting this with real funds.
+
+**The port-shape mismatch flagged two rounds ago is fixed.**
+`ExchangeClient` used to only offer a quantity-based `submit_order`,
+which assumed you already know a price - PumpPortal's actual buy
+interface is "spend this much SOL," with no price to pre-compute
+without bonding-curve math. `submit_buy_by_amount` is now a first-class
+port method: `AcquisitionEngine` spends `position_size` directly and
+gets back a `FilledBuy { quantity, entry_price }` reporting what
+actually happened. Selling stays quantity-based (`submit_order`) since
+by the time you're exiting, the quantity is already known.
+
+**Consolidated risk summary, because this is the round where the bot
+became capable of spending real funds:** (1) the signing code in
+`execution.rs` is built on solana-sdk primitives unverified against the
+current pinned version - read that module's doc comment; (2) RugCheck's
+safety gate has a real fail-open risk if its field-name assumptions are
+wrong, and doesn't check sell-tax at all; (3) nothing here has been
+compiled or run, this environment has no network or Rust toolchain.
+Start with the smallest `max_position_size` you're willing to lose
+entirely, watch the logs (`RUST_LOG=debug`), and watch the wallet
+address on a block explorer during the first several trades.
 
 **EVM - not started.** [Alloy](https://alloy.rs) for building/signing
 transactions (ethers-rs, mentioned earlier in this project, is now
@@ -226,13 +275,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 `cargo run --bin ben_snipes` starts the poll loop against the demo
 venue (buys/exits with synthetic data), the real PumpPortal Solana
-source (detects real listings; execution is live if `SOLANA_PRIVATE_KEY`
-is set, but nothing will actually buy yet regardless - see "Not yet
-implemented" for why), and any EVM chains listed in
-`config/default.toml`'s `evm_chains` (empty by default - see the
-commented example in that file for what's required to enable one: your
-own RPC websocket URL with an API key, and a verified `topic0` for the
-target factory's creation event).
+source (real detection, real volume/safety filtering, and real buy/sell
+execution if `SOLANA_PRIVATE_KEY` is set - **this can spend real
+funds**, see "Automation & execution platforms" before setting it), and
+any EVM chains listed in `config/default.toml`'s `evm_chains` (empty by
+default - see the commented example in that file for what's required to
+enable one: your own RPC websocket URL with an API key, and a verified
+`topic0` for the target factory's creation event).
+
+**For a first real Solana run:** set `risk.max_position_size` in
+`config/default.toml` to the smallest amount you're willing to lose
+entirely (not a "small but meaningful" amount - genuinely willing to
+lose, given the unverified-code caveats above), run with
+`RUST_LOG=debug` to see every decision the acquisition pipeline makes,
+and watch the wallet address (logged at startup) on a block explorer
+during the first several trades rather than trusting the bot's own logs
+alone. PumpPortal doesn't support devnet, so there's no zero-risk way to
+test the live path short of this - which is exactly why starting small
+and watching closely matters here more than in most projects.
 
 To enable Solana execution: `export SOLANA_PRIVATE_KEY="<base58-encoded
 secret key>"` before running - the base58 format `solana-keygen` and
@@ -242,18 +302,20 @@ to a real, funded wallet's key.**
 
 ## Not yet implemented
 
-- **Live price/volume feed for Solana.** This is now the single biggest
-  blocker to anything actually buying: `MetricsProvider` (needed to pass
-  acquisition criteria) and `current_price()` (needed for exit timing)
-  both need real-time per-token data that doesn't exist yet -
-  bonding-curve account reads or a `subscribeTokenTrade` aggregation are
-  the two candidate approaches (see "Automation & execution platforms").
-- **EVM trade execution.** Alloy + a router/aggregator + Flashbots
-  Protect, per "Automation & execution platforms" - hasn't been started.
-- **Real Solana/EVM safety data.** `TokenSafetyChecker` is a
-  `None`-always placeholder for both real adapters. Solana needs
-  pump.fun-specific checks (mint/freeze authority state); EVM needs a
-  real sell-simulation or contract-read check.
+- **Real sell-tax detection.** `RugCheckSafetyChecker` always reports
+  `sell_tax_bps = 0` - not because it's confirmed zero, but because
+  RugCheck doesn't appear to expose this and no sell-simulation-based
+  check has been built. If this matters for your risk tolerance, don't
+  rely on `SafetyCriteria`'s tax check via this checker alone.
+- **EVM trade execution and safety/metrics data.** Alloy + a
+  router/aggregator + Flashbots Protect for execution (per "Automation &
+  execution platforms"); `MetricsProvider`/`TokenSafetyChecker` for EVM
+  are still `None`-always placeholders. None of this has been started.
+- **Pre-trade balance checks and retry logic.** No check that the
+  wallet has enough SOL for a buy plus fees before attempting one, and
+  no retry-with-backoff on transient RPC failures (a single failed RPC
+  call currently just fails that attempt outright, relying on the next
+  poll tick to retry from scratch).
 - **Wallet secrets management.** `SOLANA_PRIVATE_KEY` is read directly
   from the environment - fine for a single trusted deployment, not for
   production secrets hygiene. A real deployment wants this from a
@@ -270,6 +332,9 @@ to a real, funded wallet's key.**
 - **EVM `topic0` values.** Not hardcoded anywhere on purpose - see
   `ben_snipes-adapter-evm-onchain`'s crate docs for why, and what to do
   instead before enabling a chain.
+- **Transaction simulation before signing.** A pre-flight
+  `simulateTransaction` check would catch some failures before spending
+  a real fee attempting them - not implemented.
 
 ## License
 
