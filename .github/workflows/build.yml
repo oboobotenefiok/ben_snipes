@@ -31,7 +31,7 @@ jobs:
         run: cargo build --workspace --verbose
 
       - name: Run tests
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --verbose --no-fail-fast
 
-   #   - name: Clippy (warnings are errors)
-   #     run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings

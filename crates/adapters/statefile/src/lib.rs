@@ -113,6 +113,7 @@ mod tests {
         let state = KnownListings {
             seen_keys: seen,
             cursor: Some("cursor-123".to_string()),
+            bootstrapped: true,
         };
 
         store.save("mexc", &state).await.expect("save to temp dir should not fail");
