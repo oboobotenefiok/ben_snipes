@@ -1,6 +1,5 @@
 use ben_snipes_domain::{
     AcquisitionCriteria, CanonicalTokenId, Listing, Position, ProfitTarget, SafetyCriteria,
-    StopLoss,
 };
 use ben_snipes_ports::{
     AcquisitionLedger, ExchangeClient, MetricsProvider, PortError, TokenSafetyChecker,
@@ -44,7 +43,6 @@ pub struct AcquisitionEngine {
     ledger: Arc<dyn AcquisitionLedger>,
     criteria: AcquisitionCriteria,
     take_profit: ProfitTarget,
-    stop_loss: StopLoss,
     /// Quote-currency amount to spend per position, e.g. 25.0 USDT.
     /// This is the single number that caps how much a single bad
     /// listing can cost - see the README for why this isn't optional.
@@ -60,7 +58,6 @@ impl AcquisitionEngine {
         ledger: Arc<dyn AcquisitionLedger>,
         criteria: AcquisitionCriteria,
         take_profit: ProfitTarget,
-        stop_loss: StopLoss,
         position_size: Decimal,
         safety_gate: Option<SafetyGate>,
     ) -> Self {
@@ -70,7 +67,6 @@ impl AcquisitionEngine {
             ledger,
             criteria,
             take_profit,
-            stop_loss,
             position_size,
             safety_gate,
         }
@@ -152,10 +148,9 @@ impl AcquisitionEngine {
         let position = Position::new(
             listing.venue.clone(),
             listing.symbol.clone(),
-            price,
+            filled.entry_price,
             filled.quantity,
             self.take_profit,
-            self.stop_loss,
         );
 
         Ok(Some(position))
@@ -287,7 +282,6 @@ mod tests {
             ledger,
             AcquisitionCriteria::new(Decimal::from(50_000)).expect("literal criteria is valid"),
             ProfitTarget::from_percent(Decimal::TEN).expect("valid target"),
-            StopLoss::from_percent(Decimal::from(5)).expect("valid stop-loss"),
             Decimal::from(25),
             safety_gate,
         )

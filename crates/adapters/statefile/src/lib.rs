@@ -15,7 +15,9 @@ use tokio::fs;
 use tracing::debug;
 
 mod ledger;
+mod position_store;
 pub use ledger::FileAcquisitionLedger;
+pub use position_store::FilePositionStore;
 
 pub struct StatefileStore {
     directory: PathBuf,

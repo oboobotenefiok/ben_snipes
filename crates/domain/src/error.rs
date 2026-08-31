@@ -8,9 +8,6 @@ pub enum DomainError {
     #[error("take-profit percentage must be positive, got {0}")]
     InvalidProfitTarget(String),
 
-    #[error("stop-loss percentage must be positive, got {0}")]
-    InvalidStopLoss(String),
-
     #[error("symbol cannot be empty")]
     EmptySymbol,
 

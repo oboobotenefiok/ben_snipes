@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 
 /// A take-profit rule expressed as a percentage above entry price, e.g.
 /// `ProfitTarget::from_percent(10)` for "sell at +10%".
+///
+/// This is the *only* exit condition this bot uses, by design: it holds
+/// a position until the target is reached, however long that takes,
+/// rather than cutting losses early. That's a deliberate strategy
+/// choice, not an oversight - see `Position::should_exit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfitTarget(Decimal);
 
@@ -31,49 +36,6 @@ impl ProfitTarget {
     }
 }
 
-/// A stop-loss rule expressed as a percentage below entry price, e.g.
-/// `StopLoss::from_percent(5)` for "sell at -5%".
-///
-/// This exists because a take-profit target alone is a one-way bet: a
-/// position that never reaches +10% just sits there forever, and a
-/// single bad listing (a slow rug, a dead market with no buyers left)
-/// can erase the gains from several good ones. Every position gets both
-/// a ceiling and a floor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StopLoss(Decimal);
-
-impl StopLoss {
-    pub fn from_percent(percent: Decimal) -> Result<Self, DomainError> {
-        if percent <= Decimal::ZERO {
-            return Err(DomainError::InvalidStopLoss(percent.to_string()));
-        }
-        Ok(Self(percent))
-    }
-
-    pub fn percent(&self) -> Decimal {
-        self.0
-    }
-
-    pub fn exit_price(&self, entry_price: Decimal) -> Decimal {
-        entry_price - (entry_price * self.0 / Decimal::ONE_HUNDRED)
-    }
-
-    pub fn is_triggered(&self, entry_price: Decimal, current_price: Decimal) -> bool {
-        current_price <= self.exit_price(entry_price)
-    }
-}
-
-/// Why a position was (or should be) closed. Kept separate from a plain
-/// `bool` so `PositionManager` can log and act on the actual reason
-/// rather than just "something said sell" - a take-profit and a
-/// stop-loss are very different outcomes worth telling apart in logs
-/// and, eventually, in P&L reporting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExitReason {
-    TakeProfit,
-    StopLoss,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Position {
     pub venue: Venue,
@@ -81,41 +43,24 @@ pub struct Position {
     pub entry_price: Decimal,
     pub quantity: Decimal,
     pub target: ProfitTarget,
-    pub stop_loss: StopLoss,
 }
 
 impl Position {
-    pub fn new(
-        venue: Venue,
-        symbol: Symbol,
-        entry_price: Decimal,
-        quantity: Decimal,
-        target: ProfitTarget,
-        stop_loss: StopLoss,
-    ) -> Self {
+    pub fn new(venue: Venue, symbol: Symbol, entry_price: Decimal, quantity: Decimal, target: ProfitTarget) -> Self {
         Self {
             venue,
             symbol,
             entry_price,
             quantity,
             target,
-            stop_loss,
         }
     }
 
-    /// Checks the take-profit first, then the stop-loss. If somehow both
-    /// would trigger on the same price read (only possible with a
-    /// pathological config where the stop-loss percent exceeds the
-    /// take-profit percent), take-profit wins - exiting at a gain is
-    /// never the wrong call.
-    pub fn exit_reason(&self, current_price: Decimal) -> Option<ExitReason> {
-        if self.target.is_reached(self.entry_price, current_price) {
-            Some(ExitReason::TakeProfit)
-        } else if self.stop_loss.is_triggered(self.entry_price, current_price) {
-            Some(ExitReason::StopLoss)
-        } else {
-            None
-        }
+    /// The single exit condition: has this position reached its
+    /// take-profit target. There is no stop-loss - this bot holds until
+    /// the target is reached, full stop, by explicit design.
+    pub fn should_exit(&self, current_price: Decimal) -> bool {
+        self.target.is_reached(self.entry_price, current_price)
     }
 }
 
@@ -136,21 +81,8 @@ mod tests {
         assert!(ProfitTarget::from_percent(Decimal::ZERO).is_err());
     }
 
-    #[test]
-    fn five_percent_stop_loss_computes_correct_exit_price() {
-        let stop_loss =
-            StopLoss::from_percent(Decimal::from(5)).expect("five percent is a valid stop-loss");
-        let exit = stop_loss.exit_price(Decimal::ONE_HUNDRED);
-        assert_eq!(exit, Decimal::from(95));
-    }
-
-    #[test]
-    fn rejects_non_positive_stop_loss() {
-        assert!(StopLoss::from_percent(Decimal::ZERO).is_err());
-    }
-
     fn sample_position() -> Position {
-        let venue = crate::Venue::new(crate::VenueKind::Cex, "mexc").expect("literal venue is valid");
+        let venue = crate::Venue::new(crate::VenueKind::Dex, "pumpfun").expect("literal venue is valid");
         let symbol = crate::Symbol::new("PEPEUSDT").expect("literal symbol is valid");
         Position::new(
             venue,
@@ -158,25 +90,26 @@ mod tests {
             Decimal::ONE_HUNDRED,
             Decimal::TEN,
             ProfitTarget::from_percent(Decimal::TEN).expect("valid target"),
-            StopLoss::from_percent(Decimal::from(5)).expect("valid stop-loss"),
         )
     }
 
     #[test]
-    fn exit_reason_is_none_between_the_two_thresholds() {
+    fn does_not_exit_below_target() {
         let position = sample_position();
-        assert_eq!(position.exit_reason(Decimal::from(102)), None);
+        assert!(!position.should_exit(Decimal::from(105)));
     }
 
     #[test]
-    fn exit_reason_is_take_profit_at_or_above_target() {
+    fn does_not_exit_far_below_entry_either() {
+        // The whole point: no stop-loss. A price crash doesn't trigger
+        // an exit - only reaching the take-profit target does.
         let position = sample_position();
-        assert_eq!(position.exit_reason(Decimal::from(110)), Some(ExitReason::TakeProfit));
+        assert!(!position.should_exit(Decimal::from(10)));
     }
 
     #[test]
-    fn exit_reason_is_stop_loss_at_or_below_floor() {
+    fn exits_at_or_above_target() {
         let position = sample_position();
-        assert_eq!(position.exit_reason(Decimal::from(95)), Some(ExitReason::StopLoss));
+        assert!(position.should_exit(Decimal::from(110)));
     }
 }

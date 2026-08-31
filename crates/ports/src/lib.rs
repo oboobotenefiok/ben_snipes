@@ -14,6 +14,7 @@ mod error;
 mod exchange_client;
 mod listing_source;
 mod metrics_provider;
+mod position_store;
 mod state_store;
 mod token_safety_checker;
 
@@ -23,5 +24,6 @@ pub use error::PortError;
 pub use exchange_client::ExchangeClient;
 pub use listing_source::{ListingSnapshot, ListingSource};
 pub use metrics_provider::MetricsProvider;
+pub use position_store::PositionStore;
 pub use state_store::{KnownListings, ListingStateStore};
 pub use token_safety_checker::TokenSafetyChecker;

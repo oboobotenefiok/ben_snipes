@@ -43,6 +43,7 @@ pub mod exchange_client;
 pub mod execution;
 pub mod metrics_provider;
 pub mod price_feed;
+pub mod retry;
 pub mod safety_checker;
 pub use exchange_client::PumpPortalExchangeClient;
 pub use execution::{execute_trade, load_wallet, wallet_pubkey_string, TradeAction, TradeRequest};

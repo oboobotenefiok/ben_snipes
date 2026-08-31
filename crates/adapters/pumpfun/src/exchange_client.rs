@@ -26,6 +26,7 @@
 
 use crate::execution::{execute_trade, TradeAction, TradeRequest};
 use crate::price_feed;
+use crate::retry::with_retry;
 use async_trait::async_trait;
 use ben_snipes_domain::{FilledBuy, Order, OrderSide, OrderStatus, Symbol};
 use ben_snipes_ports::{ExchangeClient, PortError};
@@ -40,6 +41,15 @@ use std::time::Duration;
 /// stuck transaction shouldn't hang the bot forever.
 const CONFIRMATION_ATTEMPTS: u32 = 30;
 const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+
+/// Minimum SOL reserved for transaction/priority fees on top of the buy
+/// amount itself. Solana fees are typically tiny, but this is a fixed,
+/// deliberately-conservative buffer rather than an exact fee estimate -
+/// the goal is catching an obviously-insufficient balance before
+/// attempting a trade, not computing the precise fee.
+const FEE_BUFFER_LAMPORTS: u64 = 5_000_000; // 0.005 SOL
 
 pub struct PumpPortalExchangeClient {
     http: reqwest::Client,
@@ -69,31 +79,47 @@ impl PumpPortalExchangeClient {
                 "params": [[signature], { "searchTransactionHistory": true }],
             });
 
-            let response = self
-                .http
-                .post(&self.rpc_url)
-                .header("Content-Type", "application/json")
-                .body(body.to_string())
-                .send()
-                .await
-                .map_err(|e| PortError::Rejected(format!("confirmation check failed: {e}")))?;
+            // A transient failure on a single poll attempt (a dropped
+            // connection, a slow RPC node) is not the same as "the
+            // transaction failed" - it just means this one check was
+            // inconclusive, so it falls through to the same
+            // keep-polling path as "not yet visible on-chain" rather
+            // than aborting the whole wait. Only an explicit on-chain
+            // `err` in a successfully-parsed response is treated as a
+            // real failure.
+            let outcome: Option<Result<(), PortError>> = async {
+                let response = self
+                    .http
+                    .post(&self.rpc_url)
+                    .header("Content-Type", "application/json")
+                    .body(body.to_string())
+                    .send()
+                    .await
+                    .ok()?;
 
-            let json: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| PortError::Rejected(format!("failed to parse confirmation response: {e}")))?;
+                let json: serde_json::Value = response.json().await.ok()?;
 
-            match json.pointer("/result/value/0") {
-                Some(status) if !status.is_null() => {
-                    if let Some(err) = status.get("err") {
-                        if !err.is_null() {
-                            return Err(PortError::Rejected(format!("transaction failed on-chain: {err}")));
+                match json.pointer("/result/value/0") {
+                    Some(status) if !status.is_null() => {
+                        if let Some(err) = status.get("err") {
+                            if !err.is_null() {
+                                return Some(Err(PortError::Rejected(format!("transaction failed on-chain: {err}"))));
+                            }
                         }
+                        Some(Ok(()))
                     }
-                    return Ok(());
+                    _ => None,
                 }
-                _ => {
-                    // Not yet visible to this RPC node - keep polling.
+            }
+            .await;
+
+            match outcome {
+                Some(result) => return result,
+                None => {
+                    // Inconclusive - either a transient error, or
+                    // genuinely not yet visible to this RPC node. Either
+                    // way, the right move is the same: wait and poll
+                    // again.
                 }
             }
 
@@ -110,49 +136,83 @@ impl PumpPortalExchangeClient {
     /// balance figure) and falls back to the float `uiAmount` field only
     /// if the string form isn't present.
     async fn token_balance(&self, mint: &str) -> Result<Decimal, PortError> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenAccountsByOwner",
-            "params": [
-                self.wallet.pubkey().to_string(),
-                { "mint": mint },
-                { "encoding": "jsonParsed" },
-            ],
-        });
+        with_retry(3, || async {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    self.wallet.pubkey().to_string(),
+                    { "mint": mint },
+                    { "encoding": "jsonParsed" },
+                ],
+            });
 
-        let response = self
-            .http
-            .post(&self.rpc_url)
-            .header("Content-Type", "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|e| PortError::Rejected(format!("balance check failed: {e}")))?;
+            let response = self
+                .http
+                .post(&self.rpc_url)
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .map_err(|e| format!("balance check failed: {e}"))?;
 
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| PortError::Rejected(format!("failed to parse balance response: {e}")))?;
+            let json: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| format!("failed to parse balance response: {e}"))?;
 
-        let token_amount = json.pointer("/result/value/0/account/data/parsed/info/tokenAmount");
+            let token_amount = json.pointer("/result/value/0/account/data/parsed/info/tokenAmount");
 
-        if let Some(s) = token_amount.and_then(|v| v.get("uiAmountString")).and_then(|v| v.as_str()) {
-            return s
-                .parse::<Decimal>()
-                .map_err(|e| PortError::Rejected(format!("could not parse token balance '{s}': {e}")));
-        }
+            if let Some(s) = token_amount.and_then(|v| v.get("uiAmountString")).and_then(|v| v.as_str()) {
+                return s.parse::<Decimal>().map_err(|e| format!("could not parse token balance '{s}': {e}"));
+            }
 
-        let ui_amount = token_amount
-            .and_then(|v| v.get("uiAmount"))
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| {
-                PortError::Rejected(
-                    "no token account balance found - the buy may not have landed yet".to_string(),
-                )
-            })?;
+            let ui_amount = token_amount
+                .and_then(|v| v.get("uiAmount"))
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| "no token account balance found - the buy may not have landed yet".to_string())?;
 
-        Decimal::try_from(ui_amount).map_err(|e| PortError::Rejected(format!("balance value was not a valid decimal: {e}")))
+            Decimal::try_from(ui_amount).map_err(|e| format!("balance value was not a valid decimal: {e}"))
+        })
+        .await
+        .map_err(PortError::Rejected)
+    }
+
+    /// SOL balance of the wallet, in whole SOL (not lamports) - used for
+    /// the pre-trade balance check in `submit_buy_by_amount`.
+    async fn sol_balance(&self) -> Result<Decimal, PortError> {
+        with_retry(3, || async {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBalance",
+                "params": [self.wallet.pubkey().to_string()],
+            });
+
+            let response = self
+                .http
+                .post(&self.rpc_url)
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .map_err(|e| format!("SOL balance check failed: {e}"))?;
+
+            let json: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| format!("failed to parse SOL balance response: {e}"))?;
+
+            let lamports = json
+                .pointer("/result/value")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| format!("no balance in RPC response: {json}"))?;
+
+            Ok(Decimal::from(lamports) / Decimal::from(LAMPORTS_PER_SOL))
+        })
+        .await
+        .map_err(PortError::Rejected)
     }
 }
 

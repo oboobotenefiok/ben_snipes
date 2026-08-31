@@ -1,8 +1,10 @@
 # ben_snipes
 
 An autonomous new-listing sniper: watches for tokens becoming newly
-tradable, buys the ones that pass a volume/safety filter, and exits at a
-configurable take-profit or stop-loss. **DEX-only.** CEX listings were
+tradable with active volume, buys them, and holds until a configurable
+take-profit target is hit - typically +10%. **There is no stop-loss, by
+design**: a position is held until it hits target, however long that
+takes; it never exits at a loss. **DEX-only.** CEX listings were
 deliberately dropped - they're too rare and too slow relative to
 on-chain launches to be worth the surface area for a bot whose whole
 edge is being early. See "Automation & execution platforms" below for
@@ -24,28 +26,32 @@ Hexagonal (ports and adapters), split across a Cargo workspace:
 
 ```
 crates/domain/       pure business types and rules: Listing, Chain,
-                      CanonicalTokenId, Position, ProfitTarget, StopLoss,
+                      CanonicalTokenId, Position, ProfitTarget,
                       AcquisitionCriteria, SafetyCriteria. No I/O.
 crates/ports/         traits the application depends on: ListingSource,
-                      ListingStateStore, AcquisitionLedger,
+                      ListingStateStore, AcquisitionLedger, PositionStore,
                       ExchangeClient, MetricsProvider,
                       TokenSafetyChecker, Clock.
 crates/application/   use cases: NewListingDetector, AcquisitionEngine,
                       PositionManager. Depends only on domain + ports.
 crates/config/        typed config loading (TOML + env overrides).
 crates/adapters/
-  statefile/          ListingStateStore (per-source JSON snapshots) and
-                      AcquisitionLedger (cross-source dedup), both
-                      file-backed with atomic temp-file+rename writes.
+  statefile/          ListingStateStore (per-source JSON snapshots),
+                      AcquisitionLedger (cross-source dedup), and
+                      PositionStore (open-position recovery across
+                      restarts) - all file-backed with atomic
+                      temp-file+rename writes.
   ws-support/          shared reconnect-with-backoff helper for the two
                       websocket-backed real adapters below.
-  pumpfun/             REAL Solana pipeline, five modules:
+  pumpfun/             REAL Solana pipeline, six modules:
                       listing detection (PumpPortal websocket),
                       execution.rs (signing/broadcast) +
                       exchange_client.rs (buy/sell, falls back to
                       detection-only with no wallet), metrics_provider.rs
                       (DexScreener volume), safety_checker.rs (RugCheck),
-                      price_feed.rs (Jupiter price, SOL-denominated).
+                      price_feed.rs (Jupiter price, SOL-denominated),
+                      retry.rs (shared retry-with-backoff for the
+                      transient-failure-prone network calls above).
   evm-onchain/         REAL EVM ListingSource: subscribes directly to a
                       DEX factory's pair-creation logs over eth_subscribe.
                       Chain/factory/event-agnostic, configured per chain.
@@ -95,6 +101,23 @@ instances sharing the same state directory. Running more than one
 instance against the same ledger file needs a real concurrent store
 (e.g. a database with a unique constraint) instead.
 
+### Surviving a restart: `PositionStore`
+
+Without this, a crash after a real buy doesn't just lose bookkeeping -
+it orphans the position entirely. The `AcquisitionLedger` reservation
+persists (correctly - the token really was bought, it shouldn't be
+bought again), but the open-position list used to live only in the
+runner's memory, so nothing would be left watching that position for
+its take-profit target. Money spent, no exit mechanism, forgotten by
+the bot that spent it.
+
+`PositionStore` (port in `crates/ports`, file-backed implementation in
+`crates/adapters/statefile`) persists the complete open-position list -
+saved immediately after every buy, and again after every exit-check
+pass - and `main.rs` loads it at startup instead of always starting
+from an empty list. Same atomic temp-file+rename pattern, same
+single-process-only caveat as the ledger.
+
 ### New-listing detection strategy
 
 `NewListingDetector` supports two source shapes:
@@ -129,9 +152,11 @@ check the optional `SafetyGate` (honeypot/rug signals: sell tax,
 ownership renounced, liquidity locked, mintable supply -
 `safety.max_sell_tax_bps` in config) -> reserve the `CanonicalTokenId`
 in the ledger -> size from `risk.max_position_size` and buy.
-`PositionManager` then watches every open position and exits on
-whichever of `risk.take_profit_percent` / `risk.stop_loss_percent`
-fires first.
+`PositionManager` then watches every open position and exits once
+`risk.take_profit_percent` is reached - and only then. There is no
+stop-loss: a position that drops after entry is simply held, however
+long it takes to recover to target, rather than sold at a loss. This is
+a deliberate strategy choice ("10% or nothing"), not an oversight.
 
 **`dex-mock`** has a real, working `SafetyGate` with hand-set
 demo data, purely to prove the full pipeline. **`pumpfun` and
@@ -199,7 +224,7 @@ at three different confidence levels, and it matters which is which:**
   are USD-denominated, but `entry_price` throughout this codebase is
   SOL-denominated (it comes from `quote_amount spent in SOL / quantity
   received`). Comparing a raw USD price against a SOL-denominated
-  take-profit/stop-loss target would be wrong by roughly the SOL/USD
+  take-profit target would be wrong by roughly the SOL/USD
   exchange rate, not a rounding error - `fetch_price` converts by
   fetching SOL's own price in the same batched call.
 - **`MetricsProvider` (DexScreener single-token lookup,
@@ -233,6 +258,18 @@ port method: `AcquisitionEngine` spends `position_size` directly and
 gets back a `FilledBuy { quantity, entry_price }` reporting what
 actually happened. Selling stays quantity-based (`submit_order`) since
 by the time you're exiting, the quantity is already known.
+
+**Reliability hardening added since:** `PumpPortalExchangeClient` now
+checks the wallet's SOL balance (`getBalance`, a foundational, stable
+RPC method) before attempting a buy, so an obviously-insufficient
+balance fails fast with a clear message instead of wasting a signed,
+broadcast transaction attempt. The network calls throughout
+`pumpfun` most worth retrying - the trade-local request, balance reads,
+confirmation polling - go through `retry.rs`'s backoff helper or an
+inline equivalent; every call site was checked for idempotency first
+(see that module's doc comment for the reasoning, including why
+resubmitting an identical signed transaction is safe on Solana
+specifically, unlike most payment-style APIs).
 
 **Consolidated risk summary, because this is the round where the bot
 became capable of spending real funds:** (1) the signing code in
@@ -311,11 +348,6 @@ to a real, funded wallet's key.**
   router/aggregator + Flashbots Protect for execution (per "Automation &
   execution platforms"); `MetricsProvider`/`TokenSafetyChecker` for EVM
   are still `None`-always placeholders. None of this has been started.
-- **Pre-trade balance checks and retry logic.** No check that the
-  wallet has enough SOL for a buy plus fees before attempting one, and
-  no retry-with-backoff on transient RPC failures (a single failed RPC
-  call currently just fails that attempt outright, relying on the next
-  poll tick to retry from scratch).
 - **Wallet secrets management.** `SOLANA_PRIVATE_KEY` is read directly
   from the environment - fine for a single trusted deployment, not for
   production secrets hygiene. A real deployment wants this from a
@@ -324,17 +356,27 @@ to a real, funded wallet's key.**
 - **Circuit breaker / kill switch.** No global cap on concurrent open
   positions, no auto-pause on repeated failures or an unusually large
   burst of listings (often signals a spoofed feed).
-- **Persisted open positions.** `open_positions` lives only in the
-  runner's in-memory `Vec` - a crash forgets anything not yet closed,
-  with no reconciliation against the exchange/chain on restart.
-- **Multi-instance ledger coordination.** See the `AcquisitionLedger`
-  limitation noted above.
+- **Multi-instance ledger/position-store coordination.** Both
+  `AcquisitionLedger` and `PositionStore` are atomic within one running
+  process only - not across multiple bot instances sharing the same
+  state directory.
 - **EVM `topic0` values.** Not hardcoded anywhere on purpose - see
   `ben_snipes-adapter-evm-onchain`'s crate docs for why, and what to do
   instead before enabling a chain.
 - **Transaction simulation before signing.** A pre-flight
   `simulateTransaction` check would catch some failures before spending
   a real fee attempting them - not implemented.
+- **`retry.rs`'s closure-capture pattern needs a compiler to confirm.**
+  `with_retry(3, || async { ... })` - no `move` on either layer - is
+  used at three call sites (`execute_trade`'s HTTP request,
+  `token_balance`, `sol_balance`). The reasoning it's correct: `with_retry`
+  awaits each attempt sequentially before calling again, so nothing needs
+  to outlive the call in a way that would force `move`, and everything
+  captured is either a reference or only ever borrowed, never consumed,
+  inside the closure body. This is exactly the kind of thing manual
+  review can get subtly wrong, though (a real compile error was already
+  caught and fixed once this session in a different file) - it's the
+  first thing to check if these three specific call sites fail to build.
 
 ## License
 

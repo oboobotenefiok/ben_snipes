@@ -41,6 +41,7 @@
 //! This is the single highest-risk block of code in this project - it
 //! moves money.
 
+use crate::retry::with_retry;
 use rust_decimal::Decimal;
 use solana_sdk::signer::keypair::Keypair;
 use solana_sdk::signer::Signer;
@@ -144,24 +145,27 @@ pub async fn execute_trade(
         "pool": "auto",
     });
 
-    let response = http
-        .post(TRADE_LOCAL_URL)
-        .header("Content-Type", "application/json")
-        .body(body.to_string())
-        .send()
-        .await
-        .map_err(|e| format!("trade-local request failed: {e}"))?;
+    let raw_tx_bytes = with_retry(3, || async {
+        let response = http
+            .post(TRADE_LOCAL_URL)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| format!("trade-local request failed: {e}"))?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(format!("trade-local returned {status}: {text}"));
-    }
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("trade-local returned {status}: {text}"));
+        }
 
-    let raw_tx_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("failed to read trade-local response body: {e}"))?;
+        response
+            .bytes()
+            .await
+            .map_err(|e| format!("failed to read trade-local response body: {e}"))
+    })
+    .await?;
 
     let signed_bytes = sign_transaction(wallet, &raw_tx_bytes)?;
     broadcast(http, rpc_url, &signed_bytes).await

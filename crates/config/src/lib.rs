@@ -17,13 +17,11 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiskConfig {
     /// Take-profit target as a percentage above entry price, e.g. 10.0
-    /// for the "+10%" strategy this bot is built around.
+    /// for the "+10%" strategy this bot is built around. This is the
+    /// only exit condition - there is deliberately no stop-loss. A
+    /// position is held until it hits this target, however long that
+    /// takes; it is never sold at a loss.
     pub take_profit_percent: Decimal,
-
-    /// Stop-loss floor as a percentage below entry price, e.g. 5.0 to
-    /// exit at -5%. Without this, a position that never reaches
-    /// take-profit just sits open indefinitely.
-    pub stop_loss_percent: Decimal,
 
     /// How often, in seconds, each listing source gets polled.
     pub poll_interval_seconds: u64,
@@ -37,7 +35,12 @@ pub struct RiskConfig {
     /// the sole acquisition gate. Deliberately not paired with a market
     /// cap ceiling: a high-market-cap listing with genuinely active
     /// volume is just as tradeable as a low-cap one, so market cap isn't
-    /// used to disqualify a listing either way.
+    /// used to disqualify a listing either way. "Active volume" here
+    /// means the smallest threshold that's still meaningful - enough to
+    /// indicate real trading beyond a single initial buy, not a high bar
+    /// that delays detection until a token has already built up
+    /// substantial volume. See `config/default.toml` for the reasoning
+    /// behind the specific default chosen.
     pub min_volume_24h: Decimal,
 }
 

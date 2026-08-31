@@ -1,6 +1,7 @@
 [risk]
+# The only exit condition - no stop-loss, by design. A position is held
+# until it hits this target, however long that takes.
 take_profit_percent = "10.0"
-stop_loss_percent = "5.0"
 poll_interval_seconds = 5
 # This is the real SOL amount spent per buy on the live Solana venue
 # (not just the demo) - see the README's "Automation & execution
@@ -8,7 +9,16 @@ poll_interval_seconds = 5
 # starting default now that this number has real financial teeth,
 # not a suggestion of what's "enough" to trade meaningfully.
 max_position_size = "0.01"
-min_volume_24h = "50000"
+# "Active volume" is meant as the smallest threshold that's still
+# meaningful, not a high bar - the goal is catching a listing early,
+# not waiting until it's already proven itself. 250 (USD-equivalent,
+# per DexScreener's 24h volume figure) is a judgment call, not a
+# researched-optimal number: low enough to catch a token within its
+# first few minutes if it's getting any real secondary trading beyond
+# the creator's initial buy, high enough to filter out pure noise/a
+# single small trade. Tune this if you have better intuition for where
+# that line sits.
+min_volume_24h = "250"
 
 [safety]
 # 1000 bps = 10%. Anything taxing a sell higher than this is treated as

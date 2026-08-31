@@ -32,14 +32,13 @@ use ben_snipes_adapter_pumpfun::{
     load_wallet, wallet_pubkey_string, DexScreenerMetricsProvider, NoWalletExchange,
     PumpPortalExchangeClient, PumpPortalSource, RugCheckSafetyChecker,
 };
-use ben_snipes_adapter_statefile::{FileAcquisitionLedger, StatefileStore};
+use ben_snipes_adapter_statefile::{FileAcquisitionLedger, FilePositionStore, StatefileStore};
 use ben_snipes_application::{AcquisitionEngine, NewListingDetector, PositionManager, SafetyGate};
 use ben_snipes_config::AppConfig;
 use ben_snipes_domain::{
     AcquisitionCriteria, ListingMetrics, Position, ProfitTarget, SafetyCriteria, SafetyReport,
-    StopLoss,
 };
-use ben_snipes_ports::{AcquisitionLedger, ExchangeClient, ListingSource};
+use ben_snipes_ports::{AcquisitionLedger, ExchangeClient, ListingSource, PositionStore};
 use rust_decimal::Decimal;
 use std::fmt::Display;
 use std::sync::Arc;
@@ -70,7 +69,6 @@ fn expect_valid_config<T, E: Display>(result: Result<T, E>, what: &str) -> T {
 
 struct RiskParams {
     take_profit: ProfitTarget,
-    stop_loss: StopLoss,
     criteria: AcquisitionCriteria,
     safety_criteria: SafetyCriteria,
 }
@@ -120,7 +118,6 @@ async fn build_venues(
             ledger.clone(),
             risk.criteria,
             risk.take_profit,
-            risk.stop_loss,
             config.risk.max_position_size,
             Some(demo_safety_gate),
         ),
@@ -168,7 +165,6 @@ async fn build_venues(
             ledger.clone(),
             risk.criteria,
             risk.take_profit,
-            risk.stop_loss,
             config.risk.max_position_size,
             Some(solana_safety_gate),
         ),
@@ -197,7 +193,6 @@ async fn build_venues(
                 ledger.clone(),
                 risk.criteria,
                 risk.take_profit,
-                risk.stop_loss,
                 config.risk.max_position_size,
                 None,
             ),
@@ -232,10 +227,6 @@ async fn main() {
             ProfitTarget::from_percent(config.risk.take_profit_percent),
             "risk.take_profit_percent",
         ),
-        stop_loss: expect_valid_config(
-            StopLoss::from_percent(config.risk.stop_loss_percent),
-            "risk.stop_loss_percent",
-        ),
         criteria: expect_valid_config(
             AcquisitionCriteria::new(config.risk.min_volume_24h),
             "risk.min_volume_24h",
@@ -245,7 +236,6 @@ async fn main() {
 
     info!(
         take_profit_percent = %config.risk.take_profit_percent,
-        stop_loss_percent = %config.risk.stop_loss_percent,
         min_volume_24h = %config.risk.min_volume_24h,
         max_position_size = %config.risk.max_position_size,
         max_sell_tax_bps = config.safety.max_sell_tax_bps,
@@ -263,9 +253,14 @@ async fn main() {
         "acquisition ledger file",
     ));
 
+    let position_store = FilePositionStore::new(format!("{}/open-positions.json", config.storage.state_dir));
+    let mut open_positions: Vec<Position> = expect_valid_config(position_store.load().await, "open positions file");
+    if !open_positions.is_empty() {
+        info!(count = open_positions.len(), "recovered open positions from a previous run");
+    }
+
     let venues = build_venues(&config, &risk, ledger).await;
 
-    let mut open_positions: Vec<Position> = Vec::new();
     let mut interval = tokio::time::interval(Duration::from_secs(config.risk.poll_interval_seconds));
     let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
@@ -297,6 +292,9 @@ async fn main() {
                                     "position opened, now watching for take-profit / stop-loss"
                                 );
                                 open_positions.push(position);
+                                if let Err(e) = position_store.save(&open_positions).await {
+                                    warn!(error = %e, "failed to persist open positions after a buy - position is still tracked in memory this run");
+                                }
                             }
                             Ok(None) => {
                                 info!(symbol = listing.symbol.as_str(), "did not qualify for acquisition, skipped");
@@ -322,8 +320,8 @@ async fn main() {
                     };
 
                     match venue.position_manager.check_and_exit(&position).await {
-                        Ok(Some((_filled_order, reason))) => {
-                            info!(symbol = position.symbol.as_str(), reason = ?reason, "position closed");
+                        Ok(Some(_filled_order)) => {
+                            info!(symbol = position.symbol.as_str(), "take-profit reached, position closed");
                         }
                         Ok(None) => still_open.push(position),
                         Err(e) => {
@@ -333,6 +331,9 @@ async fn main() {
                     }
                 }
                 open_positions = still_open;
+                if let Err(e) = position_store.save(&open_positions).await {
+                    warn!(error = %e, "failed to persist open positions after exit checks");
+                }
             }
             _ = &mut shutdown => {
                 info!(open_positions = open_positions.len(), "shutdown signal received, exiting cleanly");

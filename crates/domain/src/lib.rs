@@ -23,6 +23,6 @@ pub use chain::Chain;
 pub use error::DomainError;
 pub use listing::{Listing, Symbol};
 pub use order::{FilledBuy, Order, OrderSide, OrderStatus};
-pub use position::{ExitReason, Position, ProfitTarget, StopLoss};
+pub use position::{Position, ProfitTarget};
 pub use safety::{SafetyCriteria, SafetyReport};
 pub use venue::{Venue, VenueKind};
