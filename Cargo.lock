@@ -156,7 +156,9 @@ name = "ben_snipes-adapter-statefile"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "ben_snipes-domain",
  "ben_snipes-ports",
+ "rust_decimal",
  "serde_json",
  "tokio",
  "tracing",

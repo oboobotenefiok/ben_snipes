@@ -1,7 +1,8 @@
 --- ./config/default.toml ---
 [risk]
+# The only exit condition - no stop-loss, by design. A position is held
+# until it hits this target, however long that takes.
 take_profit_percent = "10.0"
-stop_loss_percent = "5.0"
 poll_interval_seconds = 5
 # This is the real SOL amount spent per buy on the live Solana venue
 # (not just the demo) - see the README's "Automation & execution
@@ -9,7 +10,16 @@ poll_interval_seconds = 5
 # starting default now that this number has real financial teeth,
 # not a suggestion of what's "enough" to trade meaningfully.
 max_position_size = "0.01"
-min_volume_24h = "50000"
+# "Active volume" is meant as the smallest threshold that's still
+# meaningful, not a high bar - the goal is catching a listing early,
+# not waiting until it's already proven itself. 250 (USD-equivalent,
+# per DexScreener's 24h volume figure) is a judgment call, not a
+# researched-optimal number: low enough to catch a token within its
+# first few minutes if it's getting any real secondary trading beyond
+# the creator's initial buy, high enough to filter out pure noise/a
+# single small trade. Tune this if you have better intuition for where
+# that line sits.
+min_volume_24h = "250"
 
 [safety]
 # 1000 bps = 10%. Anything taxing a sell higher than this is treated as
@@ -128,13 +138,11 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiskConfig {
     /// Take-profit target as a percentage above entry price, e.g. 10.0
-    /// for the "+10%" strategy this bot is built around.
+    /// for the "+10%" strategy this bot is built around. This is the
+    /// only exit condition - there is deliberately no stop-loss. A
+    /// position is held until it hits this target, however long that
+    /// takes; it is never sold at a loss.
     pub take_profit_percent: Decimal,
-
-    /// Stop-loss floor as a percentage below entry price, e.g. 5.0 to
-    /// exit at -5%. Without this, a position that never reaches
-    /// take-profit just sits open indefinitely.
-    pub stop_loss_percent: Decimal,
 
     /// How often, in seconds, each listing source gets polled.
     pub poll_interval_seconds: u64,
@@ -148,7 +156,12 @@ pub struct RiskConfig {
     /// the sole acquisition gate. Deliberately not paired with a market
     /// cap ceiling: a high-market-cap listing with genuinely active
     /// volume is just as tradeable as a low-cap one, so market cap isn't
-    /// used to disqualify a listing either way.
+    /// used to disqualify a listing either way. "Active volume" here
+    /// means the smallest threshold that's still meaningful - enough to
+    /// indicate real trading beyond a single initial buy, not a high bar
+    /// that delays detection until a token has already built up
+    /// substantial volume. See `config/default.toml` for the reasoning
+    /// behind the specific default chosen.
     pub min_volume_24h: Decimal,
 }
 
@@ -257,15 +270,16 @@ config = { workspace = true }
 rust_decimal = { workspace = true }
 
 --- ./crates/application/src/position_manager.rs ---
-use ben_snipes_domain::{ExitReason, Order, OrderSide, Position};
+use ben_snipes_domain::{Order, OrderSide, Position};
 use ben_snipes_ports::{ExchangeClient, PortError};
 use std::sync::Arc;
 use tracing::info;
 
-/// Watches a single open position and exits it once either the
-/// take-profit target or the stop-loss floor is reached - see
-/// `Position::exit_reason` for which one wins if both would somehow
-/// trigger on the same price read.
+/// Watches a single open position and exits it once the take-profit
+/// target is reached. There is no stop-loss in this bot, by explicit
+/// design: a position is held until it hits +10% (or whatever
+/// `risk.take_profit_percent` is configured to), however long that
+/// takes - it never exits at a loss.
 pub struct PositionManager {
     exchange: Arc<dyn ExchangeClient>,
 }
@@ -275,25 +289,22 @@ impl PositionManager {
         Self { exchange }
     }
 
-    /// Checks the current price against the position's take-profit and
-    /// stop-loss. Returns `Some((order, reason))` if an exit order was
-    /// submitted, `None` if neither threshold has been reached yet.
-    pub async fn check_and_exit(
-        &self,
-        position: &Position,
-    ) -> Result<Option<(Order, ExitReason)>, PortError> {
+    /// Checks the current price against the position's take-profit
+    /// target. Returns `Some(order)` if an exit order was submitted,
+    /// `None` if the target hasn't been reached yet - which, absent a
+    /// stop-loss, just means "keep holding".
+    pub async fn check_and_exit(&self, position: &Position) -> Result<Option<Order>, PortError> {
         let current_price = self.exchange.current_price(&position.symbol).await?;
 
-        let Some(reason) = position.exit_reason(current_price) else {
+        if !position.should_exit(current_price) {
             return Ok(None);
-        };
+        }
 
         info!(
             symbol = position.symbol.as_str(),
             entry = %position.entry_price,
             current = %current_price,
-            reason = ?reason,
-            "exit threshold reached, submitting exit order"
+            "take-profit target reached, submitting exit order"
         );
 
         let order = Order::new(
@@ -304,7 +315,7 @@ impl PositionManager {
         )?;
 
         let filled = self.exchange.submit_order(order).await?;
-        Ok(Some((filled, reason)))
+        Ok(Some(filled))
     }
 }
 
@@ -312,7 +323,7 @@ impl PositionManager {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ben_snipes_domain::{FilledBuy, OrderStatus, ProfitTarget, StopLoss, Symbol, Venue, VenueKind};
+    use ben_snipes_domain::{FilledBuy, OrderStatus, ProfitTarget, Symbol, Venue, VenueKind};
     use rust_decimal::Decimal;
 
     struct StubExchange {
@@ -348,14 +359,28 @@ mod tests {
             Decimal::ONE_HUNDRED,
             Decimal::TEN,
             ProfitTarget::from_percent(Decimal::TEN).expect("valid target"),
-            StopLoss::from_percent(Decimal::from(5)).expect("valid stop-loss"),
         )
     }
 
     #[tokio::test]
-    async fn holds_when_price_is_between_thresholds() {
+    async fn holds_below_target() {
         let manager = PositionManager::new(Arc::new(StubExchange {
             price: Decimal::from(102),
+        }));
+
+        let result = manager
+            .check_and_exit(&sample_position())
+            .await
+            .expect("stub exchange cannot fail");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn holds_even_on_a_large_price_drop() {
+        // The whole point of dropping stop-loss: no price, however low,
+        // triggers an exit on its own.
+        let manager = PositionManager::new(Arc::new(StubExchange {
+            price: Decimal::from(10),
         }));
 
         let result = manager
@@ -371,26 +396,11 @@ mod tests {
             price: Decimal::from(115),
         }));
 
-        let (_order, reason) = manager
+        let result = manager
             .check_and_exit(&sample_position())
             .await
-            .expect("stub exchange cannot fail")
-            .expect("price is above target, should exit");
-        assert_eq!(reason, ExitReason::TakeProfit);
-    }
-
-    #[tokio::test]
-    async fn exits_on_stop_loss() {
-        let manager = PositionManager::new(Arc::new(StubExchange {
-            price: Decimal::from(90),
-        }));
-
-        let (_order, reason) = manager
-            .check_and_exit(&sample_position())
-            .await
-            .expect("stub exchange cannot fail")
-            .expect("price is below floor, should exit");
-        assert_eq!(reason, ExitReason::StopLoss);
+            .expect("stub exchange cannot fail");
+        assert!(result.is_some());
     }
 }
 
@@ -621,7 +631,6 @@ pub use position_manager::PositionManager;
 --- ./crates/application/src/acquisition_engine.rs ---
 use ben_snipes_domain::{
     AcquisitionCriteria, CanonicalTokenId, Listing, Position, ProfitTarget, SafetyCriteria,
-    StopLoss,
 };
 use ben_snipes_ports::{
     AcquisitionLedger, ExchangeClient, MetricsProvider, PortError, TokenSafetyChecker,
@@ -665,7 +674,6 @@ pub struct AcquisitionEngine {
     ledger: Arc<dyn AcquisitionLedger>,
     criteria: AcquisitionCriteria,
     take_profit: ProfitTarget,
-    stop_loss: StopLoss,
     /// Quote-currency amount to spend per position, e.g. 25.0 USDT.
     /// This is the single number that caps how much a single bad
     /// listing can cost - see the README for why this isn't optional.
@@ -681,7 +689,6 @@ impl AcquisitionEngine {
         ledger: Arc<dyn AcquisitionLedger>,
         criteria: AcquisitionCriteria,
         take_profit: ProfitTarget,
-        stop_loss: StopLoss,
         position_size: Decimal,
         safety_gate: Option<SafetyGate>,
     ) -> Self {
@@ -691,7 +698,6 @@ impl AcquisitionEngine {
             ledger,
             criteria,
             take_profit,
-            stop_loss,
             position_size,
             safety_gate,
         }
@@ -773,10 +779,9 @@ impl AcquisitionEngine {
         let position = Position::new(
             listing.venue.clone(),
             listing.symbol.clone(),
-            price,
+            filled.entry_price,
             filled.quantity,
             self.take_profit,
-            self.stop_loss,
         );
 
         Ok(Some(position))
@@ -908,7 +913,6 @@ mod tests {
             ledger,
             AcquisitionCriteria::new(Decimal::from(50_000)).expect("literal criteria is valid"),
             ProfitTarget::from_percent(Decimal::TEN).expect("valid target"),
-            StopLoss::from_percent(Decimal::from(5)).expect("valid stop-loss"),
             Decimal::from(25),
             safety_gate,
         )
@@ -1128,6 +1132,7 @@ mod error;
 mod exchange_client;
 mod listing_source;
 mod metrics_provider;
+mod position_store;
 mod state_store;
 mod token_safety_checker;
 
@@ -1137,6 +1142,7 @@ pub use error::PortError;
 pub use exchange_client::ExchangeClient;
 pub use listing_source::{ListingSnapshot, ListingSource};
 pub use metrics_provider::MetricsProvider;
+pub use position_store::PositionStore;
 pub use state_store::{KnownListings, ListingStateStore};
 pub use token_safety_checker::TokenSafetyChecker;
 
@@ -1305,6 +1311,35 @@ pub trait AcquisitionLedger: Send + Sync {
     /// permanently block ever buying that token, since the reservation
     /// would still show as claimed forever.
     async fn release(&self, canonical_id: &str) -> Result<(), PortError>;
+}
+
+--- ./crates/ports/src/position_store.rs ---
+use crate::PortError;
+use async_trait::async_trait;
+use ben_snipes_domain::Position;
+
+/// Persists the set of currently-open positions, so a restart can
+/// recover what's still held and resume watching it for exit.
+///
+/// Without this, a crash after a real buy doesn't just lose bookkeeping
+/// - it orphans the position entirely: the `AcquisitionLedger` still
+/// shows the token as already-acquired (so it's never re-detected as
+/// buyable), but nothing is left watching it for take-profit/stop-loss,
+/// since that list only ever lived in the runner's memory. This is what
+/// closes that gap.
+#[async_trait]
+pub trait PositionStore: Send + Sync {
+    /// Loads whatever was open at last save. Returns an empty list if
+    /// nothing was ever saved - a fresh deployment has nothing open yet,
+    /// which is the expected first-run state, not an error.
+    async fn load(&self) -> Result<Vec<Position>, PortError>;
+
+    /// Persists the complete current set of open positions - this
+    /// replaces whatever was saved before, it doesn't append. Called
+    /// after every change to the open-position list (a new buy, a
+    /// closed exit) so a crash between calls loses at most the single
+    /// most recent change, not the whole list.
+    async fn save(&self, positions: &[Position]) -> Result<(), PortError>;
 }
 
 --- ./crates/ports/Cargo.toml ---
@@ -1732,7 +1767,7 @@ pub use chain::Chain;
 pub use error::DomainError;
 pub use listing::{Listing, Symbol};
 pub use order::{FilledBuy, Order, OrderSide, OrderStatus};
-pub use position::{ExitReason, Position, ProfitTarget, StopLoss};
+pub use position::{Position, ProfitTarget};
 pub use safety::{SafetyCriteria, SafetyReport};
 pub use venue::{Venue, VenueKind};
 
@@ -1746,9 +1781,6 @@ use thiserror::Error;
 pub enum DomainError {
     #[error("take-profit percentage must be positive, got {0}")]
     InvalidProfitTarget(String),
-
-    #[error("stop-loss percentage must be positive, got {0}")]
-    InvalidStopLoss(String),
 
     #[error("symbol cannot be empty")]
     EmptySymbol,
@@ -1773,6 +1805,11 @@ use serde::{Deserialize, Serialize};
 
 /// A take-profit rule expressed as a percentage above entry price, e.g.
 /// `ProfitTarget::from_percent(10)` for "sell at +10%".
+///
+/// This is the *only* exit condition this bot uses, by design: it holds
+/// a position until the target is reached, however long that takes,
+/// rather than cutting losses early. That's a deliberate strategy
+/// choice, not an oversight - see `Position::should_exit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfitTarget(Decimal);
 
@@ -1800,49 +1837,6 @@ impl ProfitTarget {
     }
 }
 
-/// A stop-loss rule expressed as a percentage below entry price, e.g.
-/// `StopLoss::from_percent(5)` for "sell at -5%".
-///
-/// This exists because a take-profit target alone is a one-way bet: a
-/// position that never reaches +10% just sits there forever, and a
-/// single bad listing (a slow rug, a dead market with no buyers left)
-/// can erase the gains from several good ones. Every position gets both
-/// a ceiling and a floor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StopLoss(Decimal);
-
-impl StopLoss {
-    pub fn from_percent(percent: Decimal) -> Result<Self, DomainError> {
-        if percent <= Decimal::ZERO {
-            return Err(DomainError::InvalidStopLoss(percent.to_string()));
-        }
-        Ok(Self(percent))
-    }
-
-    pub fn percent(&self) -> Decimal {
-        self.0
-    }
-
-    pub fn exit_price(&self, entry_price: Decimal) -> Decimal {
-        entry_price - (entry_price * self.0 / Decimal::ONE_HUNDRED)
-    }
-
-    pub fn is_triggered(&self, entry_price: Decimal, current_price: Decimal) -> bool {
-        current_price <= self.exit_price(entry_price)
-    }
-}
-
-/// Why a position was (or should be) closed. Kept separate from a plain
-/// `bool` so `PositionManager` can log and act on the actual reason
-/// rather than just "something said sell" - a take-profit and a
-/// stop-loss are very different outcomes worth telling apart in logs
-/// and, eventually, in P&L reporting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExitReason {
-    TakeProfit,
-    StopLoss,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Position {
     pub venue: Venue,
@@ -1850,41 +1844,24 @@ pub struct Position {
     pub entry_price: Decimal,
     pub quantity: Decimal,
     pub target: ProfitTarget,
-    pub stop_loss: StopLoss,
 }
 
 impl Position {
-    pub fn new(
-        venue: Venue,
-        symbol: Symbol,
-        entry_price: Decimal,
-        quantity: Decimal,
-        target: ProfitTarget,
-        stop_loss: StopLoss,
-    ) -> Self {
+    pub fn new(venue: Venue, symbol: Symbol, entry_price: Decimal, quantity: Decimal, target: ProfitTarget) -> Self {
         Self {
             venue,
             symbol,
             entry_price,
             quantity,
             target,
-            stop_loss,
         }
     }
 
-    /// Checks the take-profit first, then the stop-loss. If somehow both
-    /// would trigger on the same price read (only possible with a
-    /// pathological config where the stop-loss percent exceeds the
-    /// take-profit percent), take-profit wins - exiting at a gain is
-    /// never the wrong call.
-    pub fn exit_reason(&self, current_price: Decimal) -> Option<ExitReason> {
-        if self.target.is_reached(self.entry_price, current_price) {
-            Some(ExitReason::TakeProfit)
-        } else if self.stop_loss.is_triggered(self.entry_price, current_price) {
-            Some(ExitReason::StopLoss)
-        } else {
-            None
-        }
+    /// The single exit condition: has this position reached its
+    /// take-profit target. There is no stop-loss - this bot holds until
+    /// the target is reached, full stop, by explicit design.
+    pub fn should_exit(&self, current_price: Decimal) -> bool {
+        self.target.is_reached(self.entry_price, current_price)
     }
 }
 
@@ -1905,21 +1882,8 @@ mod tests {
         assert!(ProfitTarget::from_percent(Decimal::ZERO).is_err());
     }
 
-    #[test]
-    fn five_percent_stop_loss_computes_correct_exit_price() {
-        let stop_loss =
-            StopLoss::from_percent(Decimal::from(5)).expect("five percent is a valid stop-loss");
-        let exit = stop_loss.exit_price(Decimal::ONE_HUNDRED);
-        assert_eq!(exit, Decimal::from(95));
-    }
-
-    #[test]
-    fn rejects_non_positive_stop_loss() {
-        assert!(StopLoss::from_percent(Decimal::ZERO).is_err());
-    }
-
     fn sample_position() -> Position {
-        let venue = crate::Venue::new(crate::VenueKind::Cex, "mexc").expect("literal venue is valid");
+        let venue = crate::Venue::new(crate::VenueKind::Dex, "pumpfun").expect("literal venue is valid");
         let symbol = crate::Symbol::new("PEPEUSDT").expect("literal symbol is valid");
         Position::new(
             venue,
@@ -1927,26 +1891,27 @@ mod tests {
             Decimal::ONE_HUNDRED,
             Decimal::TEN,
             ProfitTarget::from_percent(Decimal::TEN).expect("valid target"),
-            StopLoss::from_percent(Decimal::from(5)).expect("valid stop-loss"),
         )
     }
 
     #[test]
-    fn exit_reason_is_none_between_the_two_thresholds() {
+    fn does_not_exit_below_target() {
         let position = sample_position();
-        assert_eq!(position.exit_reason(Decimal::from(102)), None);
+        assert!(!position.should_exit(Decimal::from(105)));
     }
 
     #[test]
-    fn exit_reason_is_take_profit_at_or_above_target() {
+    fn does_not_exit_far_below_entry_either() {
+        // The whole point: no stop-loss. A price crash doesn't trigger
+        // an exit - only reaching the take-profit target does.
         let position = sample_position();
-        assert_eq!(position.exit_reason(Decimal::from(110)), Some(ExitReason::TakeProfit));
+        assert!(!position.should_exit(Decimal::from(10)));
     }
 
     #[test]
-    fn exit_reason_is_stop_loss_at_or_below_floor() {
+    fn exits_at_or_above_target() {
         let position = sample_position();
-        assert_eq!(position.exit_reason(Decimal::from(95)), Some(ExitReason::StopLoss));
+        assert!(position.should_exit(Decimal::from(110)));
     }
 }
 
@@ -2209,7 +2174,9 @@ use tokio::fs;
 use tracing::debug;
 
 mod ledger;
+mod position_store;
 pub use ledger::FileAcquisitionLedger;
+pub use position_store::FilePositionStore;
 
 pub struct StatefileStore {
     directory: PathBuf,
@@ -2305,6 +2272,7 @@ mod tests {
         let state = KnownListings {
             seen_keys: seen,
             cursor: Some("cursor-123".to_string()),
+            bootstrapped: true,
         };
 
         store.save("mexc", &state).await.expect("save to temp dir should not fail");
@@ -2504,6 +2472,129 @@ mod tests {
     }
 }
 
+--- ./crates/adapters/statefile/src/position_store.rs ---
+//! A file-backed `PositionStore`: one JSON file holding the complete
+//! list of currently-open positions, same atomic temp-file+rename
+//! pattern as `StatefileStore` and `FileAcquisitionLedger`.
+
+use async_trait::async_trait;
+use ben_snipes_domain::Position;
+use ben_snipes_ports::{PortError, PositionStore};
+use std::path::PathBuf;
+use tokio::fs;
+
+pub struct FilePositionStore {
+    path: PathBuf,
+}
+
+impl FilePositionStore {
+    /// Doesn't touch the filesystem at construction - same convention
+    /// as `StatefileStore`. `load` handles a not-yet-existing file as
+    /// the expected first-run state.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+#[async_trait]
+impl PositionStore for FilePositionStore {
+    async fn load(&self) -> Result<Vec<Position>, PortError> {
+        let raw = match fs::read_to_string(&self.path).await {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(PortError::Storage(Box::new(e))),
+        };
+
+        serde_json::from_str(&raw).map_err(|e| PortError::MalformedResponse {
+            venue: "position-store".to_string(),
+            reason: e.to_string(),
+        })
+    }
+
+    async fn save(&self, positions: &[Position]) -> Result<(), PortError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| PortError::Storage(Box::new(e)))?;
+        }
+
+        let tmp_path = self.path.with_extension("json.tmp");
+        let serialised = serde_json::to_vec_pretty(positions).map_err(|e| PortError::Storage(Box::new(e)))?;
+
+        fs::write(&tmp_path, serialised)
+            .await
+            .map_err(|e| PortError::Storage(Box::new(e)))?;
+        fs::rename(&tmp_path, &self.path)
+            .await
+            .map_err(|e| PortError::Storage(Box::new(e)))?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ben_snipes_domain::{ProfitTarget, Symbol, Venue, VenueKind};
+    use rust_decimal::Decimal;
+
+    fn temp_path() -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should never be before the epoch in CI")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ben_snipes-positions-test-{nanos}.json"))
+    }
+
+    fn sample_position() -> Position {
+        let venue = Venue::new(VenueKind::Dex, "pumpfun").expect("literal venue is valid");
+        let symbol = Symbol::new("someMint").expect("literal symbol is valid");
+        Position::new(
+            venue,
+            symbol,
+            Decimal::ONE,
+            Decimal::TEN,
+            ProfitTarget::from_percent(Decimal::TEN).expect("valid target"),
+        )
+    }
+
+    #[tokio::test]
+    async fn missing_file_loads_as_empty() {
+        let store = FilePositionStore::new(temp_path());
+        let loaded = store.load().await.expect("missing file is not an error");
+        assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn round_trips_open_positions() {
+        let path = temp_path();
+        let store = FilePositionStore::new(&path);
+
+        let positions = vec![sample_position()];
+        store.save(&positions).await.expect("save should not fail");
+
+        let loaded = store.load().await.expect("load should not fail");
+        assert_eq!(loaded, positions);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn save_replaces_rather_than_appends() {
+        let path = temp_path();
+        let store = FilePositionStore::new(&path);
+
+        store.save(&[sample_position()]).await.expect("save should not fail");
+        store.save(&[]).await.expect("save should not fail");
+
+        let loaded = store.load().await.expect("load should not fail");
+        assert!(loaded.is_empty(), "second save should have replaced, not appended to, the first");
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 --- ./crates/adapters/statefile/Cargo.toml ---
 [package]
 name = "ben_snipes-adapter-statefile"
@@ -2513,11 +2604,15 @@ license = "MIT"
 description = "ListingStateStore implementation backed by one JSON file per source on local disk. Simple, dependency-free persistence for sources that can't do incremental fetches and need a full-snapshot diff instead."
 
 [dependencies]
+ben_snipes-domain = { workspace = true }
 ben_snipes-ports = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+rust_decimal = { workspace = true }
 
 --- ./crates/adapters/dex-mock/src/lib.rs ---
 //! A fake DEX. Real DEXes generally let you watch on-chain events (a
@@ -2992,6 +3087,7 @@ pub mod exchange_client;
 pub mod execution;
 pub mod metrics_provider;
 pub mod price_feed;
+pub mod retry;
 pub mod safety_checker;
 pub use exchange_client::PumpPortalExchangeClient;
 pub use execution::{execute_trade, load_wallet, wallet_pubkey_string, TradeAction, TradeRequest};
@@ -3206,6 +3302,7 @@ impl ExchangeClient for NoWalletExchange {
 //! This is the single highest-risk block of code in this project - it
 //! moves money.
 
+use crate::retry::with_retry;
 use rust_decimal::Decimal;
 use solana_sdk::signer::keypair::Keypair;
 use solana_sdk::signer::Signer;
@@ -3309,24 +3406,27 @@ pub async fn execute_trade(
         "pool": "auto",
     });
 
-    let response = http
-        .post(TRADE_LOCAL_URL)
-        .header("Content-Type", "application/json")
-        .body(body.to_string())
-        .send()
-        .await
-        .map_err(|e| format!("trade-local request failed: {e}"))?;
+    let raw_tx_bytes = with_retry(3, || async {
+        let response = http
+            .post(TRADE_LOCAL_URL)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| format!("trade-local request failed: {e}"))?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(format!("trade-local returned {status}: {text}"));
-    }
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("trade-local returned {status}: {text}"));
+        }
 
-    let raw_tx_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("failed to read trade-local response body: {e}"))?;
+        response
+            .bytes()
+            .await
+            .map_err(|e| format!("failed to read trade-local response body: {e}"))
+    })
+    .await?;
 
     let signed_bytes = sign_transaction(wallet, &raw_tx_bytes)?;
     broadcast(http, rpc_url, &signed_bytes).await
@@ -3420,6 +3520,7 @@ async fn broadcast(http: &reqwest::Client, rpc_url: &str, signed_bytes: &[u8]) -
 
 use crate::execution::{execute_trade, TradeAction, TradeRequest};
 use crate::price_feed;
+use crate::retry::with_retry;
 use async_trait::async_trait;
 use ben_snipes_domain::{FilledBuy, Order, OrderSide, OrderStatus, Symbol};
 use ben_snipes_ports::{ExchangeClient, PortError};
@@ -3434,6 +3535,15 @@ use std::time::Duration;
 /// stuck transaction shouldn't hang the bot forever.
 const CONFIRMATION_ATTEMPTS: u32 = 30;
 const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+
+/// Minimum SOL reserved for transaction/priority fees on top of the buy
+/// amount itself. Solana fees are typically tiny, but this is a fixed,
+/// deliberately-conservative buffer rather than an exact fee estimate -
+/// the goal is catching an obviously-insufficient balance before
+/// attempting a trade, not computing the precise fee.
+const FEE_BUFFER_LAMPORTS: u64 = 5_000_000; // 0.005 SOL
 
 pub struct PumpPortalExchangeClient {
     http: reqwest::Client,
@@ -3463,31 +3573,47 @@ impl PumpPortalExchangeClient {
                 "params": [[signature], { "searchTransactionHistory": true }],
             });
 
-            let response = self
-                .http
-                .post(&self.rpc_url)
-                .header("Content-Type", "application/json")
-                .body(body.to_string())
-                .send()
-                .await
-                .map_err(|e| PortError::Rejected(format!("confirmation check failed: {e}")))?;
+            // A transient failure on a single poll attempt (a dropped
+            // connection, a slow RPC node) is not the same as "the
+            // transaction failed" - it just means this one check was
+            // inconclusive, so it falls through to the same
+            // keep-polling path as "not yet visible on-chain" rather
+            // than aborting the whole wait. Only an explicit on-chain
+            // `err` in a successfully-parsed response is treated as a
+            // real failure.
+            let outcome: Option<Result<(), PortError>> = async {
+                let response = self
+                    .http
+                    .post(&self.rpc_url)
+                    .header("Content-Type", "application/json")
+                    .body(body.to_string())
+                    .send()
+                    .await
+                    .ok()?;
 
-            let json: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| PortError::Rejected(format!("failed to parse confirmation response: {e}")))?;
+                let json: serde_json::Value = response.json().await.ok()?;
 
-            match json.pointer("/result/value/0") {
-                Some(status) if !status.is_null() => {
-                    if let Some(err) = status.get("err") {
-                        if !err.is_null() {
-                            return Err(PortError::Rejected(format!("transaction failed on-chain: {err}")));
+                match json.pointer("/result/value/0") {
+                    Some(status) if !status.is_null() => {
+                        if let Some(err) = status.get("err") {
+                            if !err.is_null() {
+                                return Some(Err(PortError::Rejected(format!("transaction failed on-chain: {err}"))));
+                            }
                         }
+                        Some(Ok(()))
                     }
-                    return Ok(());
+                    _ => None,
                 }
-                _ => {
-                    // Not yet visible to this RPC node - keep polling.
+            }
+            .await;
+
+            match outcome {
+                Some(result) => return result,
+                None => {
+                    // Inconclusive - either a transient error, or
+                    // genuinely not yet visible to this RPC node. Either
+                    // way, the right move is the same: wait and poll
+                    // again.
                 }
             }
 
@@ -3504,49 +3630,83 @@ impl PumpPortalExchangeClient {
     /// balance figure) and falls back to the float `uiAmount` field only
     /// if the string form isn't present.
     async fn token_balance(&self, mint: &str) -> Result<Decimal, PortError> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenAccountsByOwner",
-            "params": [
-                self.wallet.pubkey().to_string(),
-                { "mint": mint },
-                { "encoding": "jsonParsed" },
-            ],
-        });
+        with_retry(3, || async {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    self.wallet.pubkey().to_string(),
+                    { "mint": mint },
+                    { "encoding": "jsonParsed" },
+                ],
+            });
 
-        let response = self
-            .http
-            .post(&self.rpc_url)
-            .header("Content-Type", "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|e| PortError::Rejected(format!("balance check failed: {e}")))?;
+            let response = self
+                .http
+                .post(&self.rpc_url)
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .map_err(|e| format!("balance check failed: {e}"))?;
 
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| PortError::Rejected(format!("failed to parse balance response: {e}")))?;
+            let json: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| format!("failed to parse balance response: {e}"))?;
 
-        let token_amount = json.pointer("/result/value/0/account/data/parsed/info/tokenAmount");
+            let token_amount = json.pointer("/result/value/0/account/data/parsed/info/tokenAmount");
 
-        if let Some(s) = token_amount.and_then(|v| v.get("uiAmountString")).and_then(|v| v.as_str()) {
-            return s
-                .parse::<Decimal>()
-                .map_err(|e| PortError::Rejected(format!("could not parse token balance '{s}': {e}")));
-        }
+            if let Some(s) = token_amount.and_then(|v| v.get("uiAmountString")).and_then(|v| v.as_str()) {
+                return s.parse::<Decimal>().map_err(|e| format!("could not parse token balance '{s}': {e}"));
+            }
 
-        let ui_amount = token_amount
-            .and_then(|v| v.get("uiAmount"))
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| {
-                PortError::Rejected(
-                    "no token account balance found - the buy may not have landed yet".to_string(),
-                )
-            })?;
+            let ui_amount = token_amount
+                .and_then(|v| v.get("uiAmount"))
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| "no token account balance found - the buy may not have landed yet".to_string())?;
 
-        Decimal::try_from(ui_amount).map_err(|e| PortError::Rejected(format!("balance value was not a valid decimal: {e}")))
+            Decimal::try_from(ui_amount).map_err(|e| format!("balance value was not a valid decimal: {e}"))
+        })
+        .await
+        .map_err(PortError::Rejected)
+    }
+
+    /// SOL balance of the wallet, in whole SOL (not lamports) - used for
+    /// the pre-trade balance check in `submit_buy_by_amount`.
+    async fn sol_balance(&self) -> Result<Decimal, PortError> {
+        with_retry(3, || async {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBalance",
+                "params": [self.wallet.pubkey().to_string()],
+            });
+
+            let response = self
+                .http
+                .post(&self.rpc_url)
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .map_err(|e| format!("SOL balance check failed: {e}"))?;
+
+            let json: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| format!("failed to parse SOL balance response: {e}"))?;
+
+            let lamports = json
+                .pointer("/result/value")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| format!("no balance in RPC response: {json}"))?;
+
+            Ok(Decimal::from(lamports) / Decimal::from(LAMPORTS_PER_SOL))
+        })
+        .await
+        .map_err(PortError::Rejected)
     }
 }
 
@@ -3996,6 +4156,108 @@ impl MetricsProvider for DexScreenerMetricsProvider {
     }
 }
 
+--- ./crates/adapters/pumpfun/src/retry.rs ---
+//! A small retry-with-backoff helper for the transient-failure-prone
+//! network calls throughout this crate (RPC calls, PumpPortal/DexScreener/
+//! RugCheck/Jupiter HTTP requests).
+//!
+//! **Every call site this is used on has been checked for idempotency
+//! before wrapping it** - retrying isn't free to reach for blindly.
+//! Reads (balance checks, price/metrics/safety lookups) are always safe
+//! to retry. The two calls that "do" something - requesting an unsigned
+//! transaction from PumpPortal, and broadcasting a signed one - are also
+//! safe here specifically: `trade-local` is a stateless "build me a
+//! transaction" request with no server-side side effect, and
+//! resubmitting the exact same signed transaction bytes to
+//! `sendTransaction` is a standard, safe pattern in Solana tooling (the
+//! network treats a duplicate submission as a no-op, not a double
+//! execution). Don't reach for this on a call that isn't verified safe
+//! to repeat.
+
+use std::future::Future;
+use std::time::Duration;
+use tracing::debug;
+
+const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Calls `f` up to `max_attempts` times, with exponential backoff
+/// between failures, returning the first success or the last error if
+/// every attempt fails.
+pub async fn with_retry<F, Fut, T>(max_attempts: u32, mut f: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    let mut backoff = INITIAL_BACKOFF;
+    let mut last_error = String::from("max_attempts was 0");
+
+    for attempt in 1..=max_attempts.max(1) {
+        match f().await {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                debug!(attempt, max_attempts, error = %e, "attempt failed, will retry" );
+                last_error = e;
+                if attempt < max_attempts {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+    }
+
+    Err(format!("failed after {max_attempts} attempts, last error: {last_error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[tokio::test]
+    async fn succeeds_immediately_without_retrying() {
+        let calls = AtomicU32::new(0);
+        let result = with_retry(3, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, String>(42)
+        })
+        .await;
+
+        assert_eq!(result, Ok(42));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retries_until_success() {
+        let calls = AtomicU32::new(0);
+        let result = with_retry(5, || async {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err("transient".to_string())
+            } else {
+                Ok(99)
+            }
+        })
+        .await;
+
+        assert_eq!(result, Ok(99));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_max_attempts() {
+        let calls = AtomicU32::new(0);
+        let result: Result<u32, String> = with_retry(3, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("always fails".to_string())
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+}
+
 --- ./crates/adapters/pumpfun/Cargo.toml ---
 [package]
 name = "ben_snipes-adapter-pumpfun"
@@ -4359,14 +4621,13 @@ use ben_snipes_adapter_pumpfun::{
     load_wallet, wallet_pubkey_string, DexScreenerMetricsProvider, NoWalletExchange,
     PumpPortalExchangeClient, PumpPortalSource, RugCheckSafetyChecker,
 };
-use ben_snipes_adapter_statefile::{FileAcquisitionLedger, StatefileStore};
+use ben_snipes_adapter_statefile::{FileAcquisitionLedger, FilePositionStore, StatefileStore};
 use ben_snipes_application::{AcquisitionEngine, NewListingDetector, PositionManager, SafetyGate};
 use ben_snipes_config::AppConfig;
 use ben_snipes_domain::{
     AcquisitionCriteria, ListingMetrics, Position, ProfitTarget, SafetyCriteria, SafetyReport,
-    StopLoss,
 };
-use ben_snipes_ports::{AcquisitionLedger, ExchangeClient, ListingSource};
+use ben_snipes_ports::{AcquisitionLedger, ExchangeClient, ListingSource, PositionStore};
 use rust_decimal::Decimal;
 use std::fmt::Display;
 use std::sync::Arc;
@@ -4397,7 +4658,6 @@ fn expect_valid_config<T, E: Display>(result: Result<T, E>, what: &str) -> T {
 
 struct RiskParams {
     take_profit: ProfitTarget,
-    stop_loss: StopLoss,
     criteria: AcquisitionCriteria,
     safety_criteria: SafetyCriteria,
 }
@@ -4447,7 +4707,6 @@ async fn build_venues(
             ledger.clone(),
             risk.criteria,
             risk.take_profit,
-            risk.stop_loss,
             config.risk.max_position_size,
             Some(demo_safety_gate),
         ),
@@ -4495,7 +4754,6 @@ async fn build_venues(
             ledger.clone(),
             risk.criteria,
             risk.take_profit,
-            risk.stop_loss,
             config.risk.max_position_size,
             Some(solana_safety_gate),
         ),
@@ -4524,7 +4782,6 @@ async fn build_venues(
                 ledger.clone(),
                 risk.criteria,
                 risk.take_profit,
-                risk.stop_loss,
                 config.risk.max_position_size,
                 None,
             ),
@@ -4559,10 +4816,6 @@ async fn main() {
             ProfitTarget::from_percent(config.risk.take_profit_percent),
             "risk.take_profit_percent",
         ),
-        stop_loss: expect_valid_config(
-            StopLoss::from_percent(config.risk.stop_loss_percent),
-            "risk.stop_loss_percent",
-        ),
         criteria: expect_valid_config(
             AcquisitionCriteria::new(config.risk.min_volume_24h),
             "risk.min_volume_24h",
@@ -4572,7 +4825,6 @@ async fn main() {
 
     info!(
         take_profit_percent = %config.risk.take_profit_percent,
-        stop_loss_percent = %config.risk.stop_loss_percent,
         min_volume_24h = %config.risk.min_volume_24h,
         max_position_size = %config.risk.max_position_size,
         max_sell_tax_bps = config.safety.max_sell_tax_bps,
@@ -4590,9 +4842,14 @@ async fn main() {
         "acquisition ledger file",
     ));
 
+    let position_store = FilePositionStore::new(format!("{}/open-positions.json", config.storage.state_dir));
+    let mut open_positions: Vec<Position> = expect_valid_config(position_store.load().await, "open positions file");
+    if !open_positions.is_empty() {
+        info!(count = open_positions.len(), "recovered open positions from a previous run");
+    }
+
     let venues = build_venues(&config, &risk, ledger).await;
 
-    let mut open_positions: Vec<Position> = Vec::new();
     let mut interval = tokio::time::interval(Duration::from_secs(config.risk.poll_interval_seconds));
     let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
@@ -4624,6 +4881,9 @@ async fn main() {
                                     "position opened, now watching for take-profit / stop-loss"
                                 );
                                 open_positions.push(position);
+                                if let Err(e) = position_store.save(&open_positions).await {
+                                    warn!(error = %e, "failed to persist open positions after a buy - position is still tracked in memory this run");
+                                }
                             }
                             Ok(None) => {
                                 info!(symbol = listing.symbol.as_str(), "did not qualify for acquisition, skipped");
@@ -4649,8 +4909,8 @@ async fn main() {
                     };
 
                     match venue.position_manager.check_and_exit(&position).await {
-                        Ok(Some((_filled_order, reason))) => {
-                            info!(symbol = position.symbol.as_str(), reason = ?reason, "position closed");
+                        Ok(Some(_filled_order)) => {
+                            info!(symbol = position.symbol.as_str(), "take-profit reached, position closed");
                         }
                         Ok(None) => still_open.push(position),
                         Err(e) => {
@@ -4660,6 +4920,9 @@ async fn main() {
                     }
                 }
                 open_positions = still_open;
+                if let Err(e) = position_store.save(&open_positions).await {
+                    warn!(error = %e, "failed to persist open positions after exit checks");
+                }
             }
             _ = &mut shutdown => {
                 info!(open_positions = open_positions.len(), "shutdown signal received, exiting cleanly");
