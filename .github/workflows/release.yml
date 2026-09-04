@@ -16,17 +16,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ARM64 (aarch64) - Use Android NDK
           - target: aarch64-linux-android
             arch: arm64
             arch_name: ARM64 (ARMv8)
-            
+            ndk_api: 21
+            rust_target: aarch64-linux-android
+            use_cross: false
+
+          # ARMv7 (arm) - Use cross (cargo) because NDK has issues
           - target: armv7-linux-androideabi
             arch: arm
             arch_name: ARMv7 (32-bit)
-            
+            ndk_api: 21
+            rust_target: armv7-linux-androideabi
+            use_cross: true
+
+          # x86_64 - Use Android NDK
           - target: x86_64-linux-android
             arch: amd64
             arch_name: x86_64 (64-bit)
+            ndk_api: 21
+            rust_target: x86_64-linux-android
+            use_cross: false
 
     steps:
       - name: Checkout code
@@ -35,17 +47,43 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.rust_target }}
 
-      - name: Install cross
+      - name: Setup Android NDK
+        if: matrix.use_cross == false
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r26b-linux.zip
+          unzip -q android-ndk-r26b-linux.zip
+          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26b" >> $GITHUB_ENV
+          echo "$PWD/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: Configure cargo for NDK cross-compilation
+        if: matrix.use_cross == false
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << EOF
+          [target.${{ matrix.rust_target }}]
+          linker = "${{ matrix.target }}${{ matrix.ndk_api }}-clang"
+          ar = "llvm-ar"
+          EOF
+
+      - name: Install cross for ARMv7
+        if: matrix.use_cross == true
         run: cargo install cross
 
-      - name: Build with cross
-        run: cross build --release --target ${{ matrix.target }}
+      - name: Build with NDK
+        if: matrix.use_cross == false
+        env:
+          CARGO_TARGET_${{ matrix.rust_target }}_LINKER: ${{ matrix.target }}${{ matrix.ndk_api }}-clang
+        run: cargo build --release --target ${{ matrix.rust_target }}
+
+      - name: Build with cross (ARMv7)
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.rust_target }}
 
       - name: Package binary
         run: |
-          cp target/${{ matrix.target }}/release/ben_snipes ben_snipes-${{ matrix.arch }}
+          cp target/${{ matrix.rust_target }}/release/ben_snipes ben_snipes-${{ matrix.arch }}
           chmod +x ben_snipes-${{ matrix.arch }}
 
       - name: Generate checksum
