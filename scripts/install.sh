@@ -15,6 +15,11 @@ echo -e "${BLUE}║     by oboobotenefiok                      ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════╝${NC}"
 echo ""
 
+# Get the directory where the install script was called from
+# This is where the bot will be run from
+INSTALL_DIR="$(pwd)"
+echo -e "${GREEN}✓ Installation directory: $INSTALL_DIR${NC}"
+
 # Detect system architecture
 ARCH=$(uname -m)
 case $ARCH in
@@ -25,7 +30,7 @@ case $ARCH in
 esac
 echo -e "${GREEN}✓ Detected architecture: $ARCH${NC}"
 
-# 1. Download binary
+# 1. Download binary to the installation directory
 echo -e "${GREEN}→ Downloading ben_snipes binary...${NC}"
 REPO="oboobotenefiok/ben_snipes"
 LATEST_VERSION=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4)
@@ -39,19 +44,25 @@ echo -e "${GREEN}✓ Latest version: $LATEST_VERSION${NC}"
 
 # Download based on architecture
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_VERSION/ben_snipes-$ARCH"
-curl -L -o ben_snipes "$DOWNLOAD_URL"
-chmod +x ben_snipes
+curl -L -o "$INSTALL_DIR/ben_snipes" "$DOWNLOAD_URL"
+chmod +x "$INSTALL_DIR/ben_snipes"
 echo -e "${GREEN}✓ Binary downloaded and made executable${NC}"
 
-# 2. Create config directory
+# 2. Create config directory in the installation location
 echo -e "${GREEN}→ Creating configuration directory...${NC}"
+mkdir -p "$INSTALL_DIR/config"
+mkdir -p "$INSTALL_DIR/state"
+
+# Also create the user config directory for backward compatibility
 mkdir -p ~/.config/ben_snipes
 
-# Download default config from repository
+# Download default config to both the install directory and user config
 echo -e "${GREEN}→ Downloading default configuration...${NC}"
-curl -L -o ~/.config/ben_snipes/default.toml \
+curl -L -o "$INSTALL_DIR/config/default.toml" \
     "https://raw.githubusercontent.com/$REPO/main/config/default.toml"
-echo -e "${GREEN}✓ Configuration downloaded${NC}"
+# Also keep a copy in the user config dir for the wrapper script
+cp "$INSTALL_DIR/config/default.toml" ~/.config/ben_snipes/default.toml
+echo -e "${GREEN}✓ Configuration downloaded to $INSTALL_DIR/config/${NC}"
 
 # 3. Interactive environment setup
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -59,8 +70,8 @@ echo -e "${YELLOW}  Environment Configuration                 ${NC}"
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
-# Check for existing .env file
-ENV_FILE="$HOME/.config/ben_snipes/.env"
+# Check for existing .env file in the install directory
+ENV_FILE="$INSTALL_DIR/.env"
 if [ -f "$ENV_FILE" ]; then
     echo -e "${YELLOW}Existing .env file found. Load previous values? (y/n)${NC}"
     read -r load_existing
@@ -70,9 +81,10 @@ if [ -f "$ENV_FILE" ]; then
     fi
 fi
 
-# Create new .env file
+# Create new .env file in the install directory
 echo "# ben_snipes environment configuration" > "$ENV_FILE"
 echo "# Generated: $(date)" >> "$ENV_FILE"
+echo "# This file should be in the same directory as the ben_snipes binary" >> "$ENV_FILE"
 echo "" >> "$ENV_FILE"
 
 # SOLANA_PRIVATE_KEY (required for trading)
@@ -137,10 +149,12 @@ echo -e "${YELLOW}└───────────────────�
 echo -e "${BLUE}→ Configure EVM chains now? (y/N)${NC}"
 read -r configure_evm
 if [[ "$configure_evm" =~ ^[Yy]$ ]]; then
-    echo "" >> ~/.config/ben_snipes/default.toml
-    echo "# EVM Chain Configuration" >> ~/.config/ben_snipes/default.toml
-    echo "# Uncomment and configure as needed" >> ~/.config/ben_snipes/default.toml
-    echo "# See: https://github.com/$REPO#evm-configuration" >> ~/.config/ben_snipes/default.toml
+    # Update the config in the install directory
+    CONFIG_FILE="$INSTALL_DIR/config/default.toml"
+    echo "" >> "$CONFIG_FILE"
+    echo "# EVM Chain Configuration" >> "$CONFIG_FILE"
+    echo "# Uncomment and configure as needed" >> "$CONFIG_FILE"
+    echo "# See: https://github.com/$REPO#evm-configuration" >> "$CONFIG_FILE"
     
     echo -e "${BLUE}→ Enter chain name (e.g., ethereum, base):${NC}"
     read -r chain_name
@@ -154,92 +168,90 @@ if [[ "$configure_evm" =~ ^[Yy]$ ]]; then
     read -r base_assets
     
     if [ -n "$chain_name" ] && [ -n "$ws_rpc" ] && [ -n "$factory_addr" ] && [ -n "$topic0" ]; then
-        echo "" >> ~/.config/ben_snipes/default.toml
-        echo "[[evm_chains]]" >> ~/.config/ben_snipes/default.toml
-        echo "chain_name = \"$chain_name\"" >> ~/.config/ben_snipes/default.toml
-        echo "ws_rpc_url = \"$ws_rpc\"" >> ~/.config/ben_snipes/default.toml
-        echo "factory_address = \"$factory_addr\"" >> ~/.config/ben_snipes/default.toml
-        echo "topic0 = \"$topic0\"" >> ~/.config/ben_snipes/default.toml
+        echo "" >> "$CONFIG_FILE"
+        echo "[[evm_chains]]" >> "$CONFIG_FILE"
+        echo "chain_name = \"$chain_name\"" >> "$CONFIG_FILE"
+        echo "ws_rpc_url = \"$ws_rpc\"" >> "$CONFIG_FILE"
+        echo "factory_address = \"$factory_addr\"" >> "$CONFIG_FILE"
+        echo "topic0 = \"$topic0\"" >> "$CONFIG_FILE"
         
         if [ -n "$base_assets" ]; then
             IFS=',' read -ra ADDR <<< "$base_assets"
-            echo -n "base_assets = [" >> ~/.config/ben_snipes/default.toml
+            echo -n "base_assets = [" >> "$CONFIG_FILE"
             for i in "${!ADDR[@]}"; do
                 if [ $i -eq $((${#ADDR[@]} - 1)) ]; then
-                    echo "\"${ADDR[$i]}\"" >> ~/.config/ben_snipes/default.toml
+                    echo "\"${ADDR[$i]}\"" >> "$CONFIG_FILE"
                 else
-                    echo -n "\"${ADDR[$i]}\", " >> ~/.config/ben_snipes/default.toml
+                    echo -n "\"${ADDR[$i]}\", " >> "$CONFIG_FILE"
                 fi
             done
-            echo "]" >> ~/.config/ben_snipes/default.toml
+            echo "]" >> "$CONFIG_FILE"
         fi
         echo -e "${GREEN}✓ EVM chain configured: $chain_name${NC}"
+        
+        # Also update the user config for the wrapper
+        cp "$CONFIG_FILE" ~/.config/ben_snipes/default.toml
     fi
 fi
 
-# Add environment variables to termux profile
-echo -e "${GREEN}→ Adding environment variables to Termux profile...${NC}"
-BASHRC="$HOME/.bashrc"
-
-# Remove existing ben_snipes entries if any
-if grep -q "# ben_snipes environment" "$BASHRC" 2>/dev/null; then
-    sed -i '/# ben_snipes environment/,/fi/d' "$BASHRC"
-fi
-
-# Add new entries
-echo "" >> "$BASHRC"
-echo "# ben_snipes environment" >> "$BASHRC"
-echo "if [ -f ~/.config/ben_snipes/.env ]; then" >> "$BASHRC"
-echo "    set -a" >> "$BASHRC"
-echo "    source ~/.config/ben_snipes/.env" >> "$BASHRC"
-echo "    set +a" >> "$BASHRC"
-echo "fi" >> "$BASHRC"
-echo -e "${GREEN}✓ Added to ~/.bashrc${NC}"
-
-# Export current session
+# Export current session from the .env file
 set -a
 source "$ENV_FILE"
 set +a
 
-# 4. Create wrapper script
+# 4. Create wrapper script in the installation directory
 echo -e "${GREEN}→ Creating wrapper script...${NC}"
-cat > ben_snipes-wrapper << 'EOF'
+cat > "$INSTALL_DIR/ben_snipes-wrapper" << 'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
-if [ -f ~/.config/ben_snipes/.env ]; then
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load environment variables from the .env file in the same directory
+if [ -f "$SCRIPT_DIR/.env" ]; then
     set -a
-    source ~/.config/ben_snipes/.env
+    source "$SCRIPT_DIR/.env"
     set +a
 fi
+
+# Run the bot from its own directory
+cd "$SCRIPT_DIR"
 exec ./ben_snipes "$@"
 EOF
-chmod +x ben_snipes-wrapper
+chmod +x "$INSTALL_DIR/ben_snipes-wrapper"
 echo -e "${GREEN}✓ Wrapper script created${NC}"
+
+# Also create a symlink in ~/.local/bin for easy access (optional)
+mkdir -p ~/.local/bin
+ln -sf "$INSTALL_DIR/ben_snipes-wrapper" ~/.local/bin/ben_snipes 2>/dev/null || true
 
 # 5. Test the installation
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${YELLOW}  Test Installation                         ${NC}"
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
+cd "$INSTALL_DIR"
 echo -e "${GREEN}→ Testing binary...${NC}"
 ./ben_snipes --version 2>/dev/null || echo -e "${YELLOW}⚠ Version check skipped (--version not implemented)${NC}"
 
 echo ""
 echo -e "${GREEN}✅ Installation complete!${NC}"
 echo ""
-echo -e "${BLUE}┌────────────────────────────────────────────┐${NC}"
-echo -e "${BLUE}│  NEXT STEPS                               │${NC}"
-echo -e "${BLUE}├────────────────────────────────────────────┘${NC}"
-echo -e "${YELLOW}1.${NC} Edit configuration: ${BLUE}nano ~/.config/ben_snipes/default.toml${NC}"
+echo -e "${BLUE}┌────────────────────────────────────────────────────────────┐${NC}"
+echo -e "${BLUE}│  NEXT STEPS                                               │${NC}"
+echo -e "${BLUE}├────────────────────────────────────────────────────────────┘${NC}"
+echo -e "${YELLOW}1.${NC} The bot is installed in: ${BLUE}$INSTALL_DIR${NC}"
+echo -e "${YELLOW}2.${NC} Edit configuration: ${BLUE}nano $INSTALL_DIR/config/default.toml${NC}"
 echo -e "${YELLOW}   ${NC}- Adjust ${BLUE}take_profit_percent${NC} (default: 10.0)"
 echo -e "${YELLOW}   ${NC}- Adjust ${BLUE}max_position_size${NC} (default: 0.01 SOL)"
 echo -e "${YELLOW}   ${NC}- Adjust ${BLUE}min_volume_24h${NC} (default: 250)"
 echo ""
-echo -e "${YELLOW}2.${NC} Run the bot: ${BLUE}./ben_snipes-wrapper${NC}"
-echo -e "${YELLOW}   ${NC}Or directly: ${BLUE}./ben_snipes${NC}"
+echo -e "${YELLOW}3.${NC} Run the bot: ${BLUE}cd $INSTALL_DIR && ./ben_snipes-wrapper${NC}"
+echo -e "${YELLOW}   ${NC}Or from anywhere: ${BLUE}ben_snipes${NC} (if ~/.local/bin is in PATH)"
 echo ""
-echo -e "${YELLOW}3.${NC} To update: ${BLUE}./ben_snipes-wrapper --update${NC}"
+echo -e "${YELLOW}4.${NC} To update: ${BLUE}./ben_snipes-wrapper --update${NC}"
 echo ""
-echo -e "${YELLOW}4.${NC} Monitor logs: ${BLUE}RUST_LOG=info ./ben_snipes-wrapper${NC}"
+echo -e "${YELLOW}5.${NC} Monitor logs: ${BLUE}RUST_LOG=info ./ben_snipes-wrapper${NC}"
 echo ""
 echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${RED}⚠  IMPORTANT SAFETY NOTES${NC}"
@@ -249,5 +261,5 @@ echo -e "${YELLOW}   • ${RED}Test with detection-only mode first${NC}"
 echo -e "${YELLOW}   • ${RED}Start with the minimum position size (0.01 SOL)${NC}"
 echo -e "${YELLOW}   • ${RED}Monitor the bot's behavior for the first hour${NC}"
 echo -e "${YELLOW}   • ${RED}Never share your private key${NC}"
-echo -e "${YELLOW}   • ${RED}Backup your configuration: cp ~/.config/ben_snipes/.env ~/backup/${NC}"
+echo -e "${YELLOW}   • ${RED}Backup your configuration: cp $INSTALL_DIR/.env ~/backup/${NC}"
 echo ""
