@@ -16,26 +16,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ARM64 (aarch64) - ARMv8-A and newer, most modern Android devices
           - target: aarch64-linux-android
             arch: arm64
             arch_name: ARM64 (ARMv8)
-            ndk_api: 21
-            rust_target: aarch64-linux-android
-
-          # ARMv7 (arm) - 32-bit, older Android devices
+            
           - target: armv7-linux-androideabi
             arch: arm
             arch_name: ARMv7 (32-bit)
-            ndk_api: 21
-            rust_target: armv7-linux-androideabi
-
-          # x86_64 - Android tablets/emulators/Chromebooks
+            
           - target: x86_64-linux-android
             arch: amd64
             arch_name: x86_64 (64-bit)
-            ndk_api: 21
-            rust_target: x86_64-linux-android
 
     steps:
       - name: Checkout code
@@ -44,37 +35,18 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.rust_target }}
+          targets: ${{ matrix.target }}
 
-      - name: Setup Android NDK
-        run: |
-          wget -q https://dl.google.com/android/repository/android-ndk-r26b-linux.zip
-          unzip -q android-ndk-r26b-linux.zip
-          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26b" >> $GITHUB_ENV
-          echo "$PWD/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+      - name: Install cross
+        run: cargo install cross
 
-      - name: Configure cargo for cross-compilation
-        run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml << EOF
-          [target.${{ matrix.rust_target }}]
-          linker = "${{ matrix.target }}${{ matrix.ndk_api }}-clang"
-          ar = "llvm-ar"
-          EOF
-
-      - name: Build release binary
-        env:
-          CARGO_TARGET_${{ matrix.rust_target }}_LINKER: ${{ matrix.target }}${{ matrix.ndk_api }}-clang
-        run: cargo build --release --target ${{ matrix.rust_target }}
+      - name: Build with cross
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
-          # Name matches what install.sh expects: ben_snipes-arm64, ben_snipes-arm, ben_snipes-amd64
-          cp target/${{ matrix.rust_target }}/release/ben_snipes ben_snipes-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/ben_snipes ben_snipes-${{ matrix.arch }}
           chmod +x ben_snipes-${{ matrix.arch }}
-
-          # Also create a versioned copy for debugging
-          cp ben_snipes-${{ matrix.arch }} ben_snipes-${{ matrix.arch }}-${{ github.ref_name }}
 
       - name: Generate checksum
         run: |
@@ -89,7 +61,6 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
 
-  # Create a summary of all builds
   release-summary:
     name: Create Release Summary
     needs: build
