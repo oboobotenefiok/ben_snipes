@@ -3,6 +3,11 @@
 # until it hits this target, however long that takes.
 take_profit_percent = "10.0"
 poll_interval_seconds = 5
+# A newly detected token can exist on-chain before DexScreener indexes it, or
+# can be indexed before it has enough volume to qualify. Keep it in the
+# persistent pending cursor and retry the metrics/safety lookup every 20
+# seconds for 24 hours. A temporary low-volume result is not a rejection.
+pending_listing_retry_seconds = 20
 # This is the real SOL amount spent per buy on the live Solana venue
 # (not just the demo) - see the README's "Automation & execution
 # platforms" before raising this. 0.01 SOL is a deliberately small
@@ -19,6 +24,10 @@ max_position_size = "0.01"
 # single small trade. Tune this if you have better intuition for where
 # that line sits.
 min_volume_24h = "250"
+max_open_positions = 3
+max_consecutive_failures = 5
+max_new_listings_per_cycle = 20
+entry_kill_switch_file = "state/STOP_ENTRIES"
 
 [safety]
 # 1000 bps = 10%. Anything taxing a sell higher than this is treated as
@@ -57,12 +66,18 @@ priority_fee_sol = "0.0001"
 # Example (uncomment and fill in to enable):
 # [[evm_chains]]
 # chain_name = "ethereum"
+# chain_id = 1
 # ws_rpc_url = "wss://YOUR-PROVIDER-WS-ENDPOINT-WITH-API-KEY"
-# factory_address = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"  # Uniswap V2 factory, mainnet
+# execution_rpc_url = "https://YOUR-PROVIDER-HTTP-ENDPOINT-WITH-API-KEY"
+# private_rpc_url = "https://rpc.flashbots.net/fast"
+# factory_address = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
 # topic0 = "PUT-THE-VERIFIED-PairCreated-TOPIC-HASH-HERE"
 # base_assets = [
-#     "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
-#     "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
-#     "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
+#     "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+#     "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eB48",
+#     "0xdac17f958d2ee523a2206206994597c13d831ec7",
 # ]
+# router_address = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
+# wrapped_native_address = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+# slippage_percent = 10
 evm_chains = []

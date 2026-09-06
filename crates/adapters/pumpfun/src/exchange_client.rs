@@ -204,6 +204,10 @@ impl PumpPortalExchangeClient {
                 .await
                 .map_err(|e| format!("failed to parse SOL balance response: {e}"))?;
 
+            if let Some(error) = json.get("error") {
+                return Err(format!("SOL balance RPC returned an error: {error}"));
+            }
+
             let lamports = json
                 .pointer("/result/value")
                 .and_then(|v| v.as_u64())
@@ -229,6 +233,30 @@ impl ExchangeClient for PumpPortalExchangeClient {
     }
 
     async fn submit_buy_by_amount(&self, symbol: &Symbol, quote_amount: Decimal) -> Result<FilledBuy, PortError> {
+        if quote_amount <= Decimal::ZERO {
+            return Err(PortError::Rejected(format!(
+                "buy amount must be positive, got {quote_amount}"
+            )));
+        }
+
+        if self.priority_fee_sol < Decimal::ZERO {
+            return Err(PortError::Rejected(format!(
+                "priority fee must not be negative, got {}",
+                self.priority_fee_sol
+            )));
+        }
+
+        let balance = self.sol_balance().await?;
+        let required_balance = quote_amount
+            + self.priority_fee_sol
+            + Decimal::from(FEE_BUFFER_LAMPORTS) / Decimal::from(LAMPORTS_PER_SOL);
+
+        if balance < required_balance {
+            return Err(PortError::Rejected(format!(
+                "insufficient SOL balance for buy: available={balance}, required={required_balance}"
+            )));
+        }
+
         let request = TradeRequest {
             action: TradeAction::Buy,
             mint: symbol.as_str().to_string(),

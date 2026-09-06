@@ -25,5 +25,5 @@ pub use exchange_client::ExchangeClient;
 pub use listing_source::{ListingSnapshot, ListingSource};
 pub use metrics_provider::MetricsProvider;
 pub use position_store::PositionStore;
-pub use state_store::{KnownListings, ListingStateStore};
+pub use state_store::{KnownListings, ListingStateStore, PendingListing};
 pub use token_safety_checker::TokenSafetyChecker;

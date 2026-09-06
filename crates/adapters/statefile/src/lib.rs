@@ -113,6 +113,7 @@ mod tests {
         let state = KnownListings {
             seen_keys: seen,
             cursor: Some("cursor-123".to_string()),
+            pending: Default::default(),
             bootstrapped: true,
         };
 

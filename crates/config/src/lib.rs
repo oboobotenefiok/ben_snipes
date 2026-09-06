@@ -26,6 +26,11 @@ pub struct RiskConfig {
     /// How often, in seconds, each listing source gets polled.
     pub poll_interval_seconds: u64,
 
+    /// How often listings that were detected before an indexer exposed
+    /// their metrics are retried. This is intentionally independent from
+    /// source polling so fast feeds do not hammer slower indexers.
+    pub pending_listing_retry_seconds: u64,
+
     /// Maximum quote-currency amount to spend on a single new listing.
     /// This is the single most important number in the whole config for
     /// keeping a bad listing from being an expensive mistake.
@@ -90,10 +95,17 @@ pub struct SolanaConfig {
 pub struct EvmChainConfig {
     /// e.g. "ethereum", "base" - becomes this source's chain identity.
     pub chain_name: String,
+    /// Numeric EVM chain ID. Used to prevent signing against the wrong network.
+    pub chain_id: u64,
     /// A websocket RPC endpoint that supports `eth_subscribe`, with your
     /// own provider API key included. There is no usable default here -
     /// this must be supplied per deployment.
     pub ws_rpc_url: String,
+    /// HTTP RPC endpoint used for reads and execution when no private RPC is configured.
+    pub execution_rpc_url: String,
+    /// Optional private transaction RPC, such as Flashbots Protect.
+    #[serde(default)]
+    pub private_rpc_url: Option<String>,
     /// The DEX factory contract address to watch on this chain.
     pub factory_address: String,
     /// keccak256 topic hash of the pair/pool-creation event for this
@@ -105,7 +117,16 @@ pub struct EvmChainConfig {
     /// chain (WETH, USDC, USDT, ...), used to identify which side of a
     /// new pair is the actual new listing.
     pub base_assets: Vec<String>,
+    /// Uniswap-V2-compatible router used for native-coin buys and token sells.
+    pub router_address: String,
+    /// Wrapped native token used as the router path endpoint.
+    pub wrapped_native_address: String,
+    /// Maximum execution slippage as a percentage.
+    #[serde(default = "default_evm_slippage_percent")]
+    pub slippage_percent: u32,
 }
+
+fn default_evm_slippage_percent() -> u32 { 10 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {

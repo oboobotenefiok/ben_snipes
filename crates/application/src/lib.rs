@@ -10,6 +10,6 @@ mod acquisition_engine;
 mod new_listing_detector;
 mod position_manager;
 
-pub use acquisition_engine::{AcquisitionEngine, SafetyGate};
+pub use acquisition_engine::{AcquisitionDecision, AcquisitionEngine, SafetyGate};
 pub use new_listing_detector::NewListingDetector;
 pub use position_manager::PositionManager;

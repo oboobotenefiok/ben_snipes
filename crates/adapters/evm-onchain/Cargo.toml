@@ -6,6 +6,7 @@ license = "MIT"
 description = "Real EVM ListingSource that subscribes directly to a DEX factory contract's pair/pool-creation logs over a websocket RPC (eth_subscribe), rather than polling an indexer API. Chain-, factory-, and event-agnostic - configured per chain, not hardcoded to one network."
 
 [dependencies]
+alloy = "2.4.1"
 ben_snipes-domain = { workspace = true }
 ben_snipes-ports = { workspace = true }
 ben_snipes-adapter-ws-support = { workspace = true }
@@ -17,3 +18,5 @@ serde_json = { workspace = true }
 rust_decimal = { workspace = true }
 time = { workspace = true }
 tracing = { workspace = true }
+
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

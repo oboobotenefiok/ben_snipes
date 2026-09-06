@@ -13,14 +13,10 @@
 //! (`#[serde(default)]` on every field) specifically so a schema drift
 //! shows up as "fewer listings than expected" rather than a hard crash.
 //!
-//! **Scope of this adapter:** detection only. `MetricsProvider` and
-//! `TokenSafetyChecker` here always return `None` - which
-//! `AcquisitionEngine` correctly treats as "not enough information to
-//! buy." That's a deliberate safe default, not a placeholder we forgot
-//! to fill in: a token minted seconds ago has no meaningful 24h volume
-//! yet, and pump.fun-specific honeypot signals (mint authority, freeze
-//! authority) need real on-chain reads this crate doesn't do. See the
-//! README's "not yet implemented" list.
+//! Detection is provided by PumpPortal, while metrics come from
+//! DexScreener and authority/liquidity checks come from RugCheck. Sell-tax
+//! remains explicitly unknown until a real sell simulation is available,
+//! so the application safety gate blocks the purchase.
 
 use async_trait::async_trait;
 use ben_snipes_adapter_ws_support::connect_with_backoff;

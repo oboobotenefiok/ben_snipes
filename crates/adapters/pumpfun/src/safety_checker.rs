@@ -11,7 +11,7 @@
 //! doesn't appear to reliably expose a sell-tax figure at all (it's
 //! fundamentally a different kind of check - authority/liquidity/holder
 //! analysis, not a sell simulation), so `sell_tax_bps` here is **always
-//! 0, which means unverified, not confirmed-safe.** If accurate sell-tax
+//! `None`, which means unverified and therefore blocked by the safety gate.** If accurate sell-tax
 //! detection matters for your risk tolerance, that needs a real sell
 //! simulation as a separate data source - don't read a `0` from this
 //! checker as "no tax", read it as "this checker doesn't know."
@@ -112,7 +112,7 @@ impl TokenSafetyChecker for RugCheckSafetyChecker {
 
         if report.rugged {
             return Ok(Some(SafetyReport {
-                sell_tax_bps: 0,
+                sell_tax_bps: None,
                 ownership_renounced: false,
                 liquidity_locked: false,
                 is_mintable: true,
@@ -147,9 +147,10 @@ impl TokenSafetyChecker for RugCheckSafetyChecker {
         };
 
         Ok(Some(SafetyReport {
-            // Always 0 - see module docs. This is "unverified", not
-            // "confirmed zero tax".
-            sell_tax_bps: 0,
+            // Unknown is represented explicitly. The domain safety gate
+            // rejects `None`, so a missing sell simulation cannot pass as a
+            // confirmed zero-tax token.
+            sell_tax_bps: None,
             ownership_renounced,
             liquidity_locked,
             is_mintable,

@@ -43,6 +43,7 @@
 
 use crate::retry::with_retry;
 use rust_decimal::Decimal;
+use solana_sdk::signature::Signature;
 use solana_sdk::signer::keypair::Keypair;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::VersionedTransaction;
@@ -167,8 +168,65 @@ pub async fn execute_trade(
     })
     .await?;
 
+    simulate_transaction(http, rpc_url, &raw_tx_bytes).await?;
+
     let signed_bytes = sign_transaction(wallet, &raw_tx_bytes)?;
     broadcast(http, rpc_url, &signed_bytes).await
+}
+
+/// Simulates the unsigned transaction before spending signing material or
+/// sending it to the cluster. Solana explicitly permits unsigned simulation
+/// when `sigVerify` is false, so this catches instruction-level failures
+/// before the wallet signs a doomed transaction.
+async fn simulate_transaction(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    raw_tx_bytes: &[u8],
+) -> Result<(), String> {
+    use base64::Engine;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(raw_tx_bytes);
+    let rpc_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "simulateTransaction",
+        "params": [
+            encoded,
+            {
+                "encoding": "base64",
+                "commitment": "confirmed",
+                "sigVerify": false,
+                "replaceRecentBlockhash": false,
+            }
+        ],
+    });
+
+    let response = http
+        .post(rpc_url)
+        .header("Content-Type", "application/json")
+        .body(rpc_body.to_string())
+        .send()
+        .await
+        .map_err(|e| format!("transaction simulation request failed: {e}"))?;
+
+    let response_json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse transaction simulation response: {e}"))?;
+
+    if let Some(error) = response_json.get("error") {
+        return Err(format!("transaction simulation RPC returned an error: {error}"));
+    }
+
+    match response_json.pointer("/result/value/err") {
+        Some(err) if !err.is_null() => {
+            Err(format!("transaction simulation failed: {err}"))
+        }
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "transaction simulation response had no result/value/err field: {response_json}"
+        )),
+    }
 }
 
 /// Deserializes PumpPortal's unsigned transaction bytes, signs the
@@ -179,14 +237,33 @@ fn sign_transaction(wallet: &Keypair, raw_tx_bytes: &[u8]) -> Result<Vec<u8>, St
     let mut tx: VersionedTransaction = bincode::deserialize(raw_tx_bytes)
         .map_err(|e| format!("failed to deserialize transaction from trade-local: {e}"))?;
 
+    tx.sanitize()
+        .map_err(|e| format!("trade-local returned an invalid transaction: {e}"))?;
+
     let account_keys = tx.message.static_account_keys();
     let signer_index = account_keys
         .iter()
         .position(|key| *key == wallet.pubkey())
         .ok_or_else(|| "wallet public key not found among the transaction's required signers".to_string())?;
 
+    let required_signatures = tx.message.header().num_required_signatures as usize;
+    if signer_index >= required_signatures {
+        return Err("wallet public key is present in the transaction but is not a required signer".to_string());
+    }
+
+    if tx.signatures.len() != required_signatures {
+        return Err(format!(
+            "transaction signature slot count mismatch: expected {required_signatures}, got {}",
+            tx.signatures.len()
+        ));
+    }
+
     let message_bytes = tx.message.serialize();
     let signature = wallet.sign_message(&message_bytes);
+    if signature == Signature::default() || !signature.verify(wallet.pubkey().as_ref(), &message_bytes) {
+        return Err("wallet failed to produce a verifiable transaction signature".to_string());
+    }
+
     tx.signatures[signer_index] = signature;
 
     bincode::serialize(&tx).map_err(|e| format!("failed to re-serialize signed transaction: {e}"))
@@ -228,4 +305,20 @@ async fn broadcast(http: &reqwest::Client, rpc_url: &str, signed_bytes: &[u8]) -
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| format!("RPC response had no result field: {response_json}"))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buy_balance_requirement_includes_fee_buffer_and_priority_fee() {
+        let required = Decimal::new(151, 4);
+        let actual = Decimal::from(10_i64) / Decimal::from(LAMPORTS_PER_SOL)
+            + Decimal::new(1, 4)
+            + Decimal::from(FEE_BUFFER_LAMPORTS) / Decimal::from(LAMPORTS_PER_SOL);
+
+        assert_eq!(actual, required);
+    }
 }

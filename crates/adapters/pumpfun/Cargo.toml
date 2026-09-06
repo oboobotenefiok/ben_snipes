@@ -3,7 +3,7 @@ name = "ben_snipes-adapter-pumpfun"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Real Solana ListingSource backed by PumpPortal's free subscribeNewToken websocket feed, plus a real (but not yet ExchangeClient-wired) signing/broadcast path for their non-custodial Local Transaction API. See crate docs for the biggest caveat: solana-sdk recently went through a major breaking restructuring, so the signing code here is built on the lowest-level primitives verifiable at the time of writing, not on higher-level convenience APIs."
+description = "Real Solana ListingSource and ExchangeClient backed by PumpPortal's subscribeNewToken feed and non-custodial Local Transaction API, with local signing, pre-trade balance checks, transaction simulation, and JSON-RPC broadcast."
 
 [dependencies]
 ben_snipes-domain = { workspace = true }

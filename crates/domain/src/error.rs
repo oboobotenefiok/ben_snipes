@@ -17,6 +17,9 @@ pub enum DomainError {
     #[error("chain identifier cannot be empty")]
     EmptyChain,
 
+    #[error("invalid chain configuration: {0}")]
+    InvalidChainConfig(String),
+
     #[error("order quantity must be positive, got {0}")]
     InvalidQuantity(String),
 

@@ -37,6 +37,13 @@ impl SafetyGate {
 /// as `Err`. The `AcquisitionLedger` reservation happens last, right
 /// before the buy, so a token only ever consumes a ledger slot once it's
 /// actually about to be bought.
+#[derive(Debug)]
+pub enum AcquisitionDecision {
+    Opened(Position),
+    Pending,
+    Rejected,
+}
+
 pub struct AcquisitionEngine {
     metrics_provider: Arc<dyn MetricsProvider>,
     exchange: Arc<dyn ExchangeClient>,
@@ -73,40 +80,42 @@ impl AcquisitionEngine {
     }
 
     /// Evaluates a freshly-detected listing and, if it qualifies, buys
-    /// it. Returns `Ok(None)` for "we looked and passed" - not finding a
-    /// reason to buy is the expected outcome for most listings, not a
-    /// failure.
-    pub async fn evaluate_and_buy(&self, listing: &Listing) -> Result<Option<Position>, PortError> {
+    /// it. `Pending` means an external indexer or safety provider has not
+    /// exposed enough information yet, or the current metrics do not meet
+    /// the acquisition threshold yet. `Rejected` is reserved for a
+    /// definitive decision such as a failed safety gate or an existing
+    /// acquisition reservation.
+    pub async fn evaluate_and_buy(&self, listing: &Listing) -> Result<AcquisitionDecision, PortError> {
         let Some(metrics) = self.metrics_provider.metrics(&listing.symbol).await? else {
             debug!(symbol = listing.symbol.as_str(), "no metrics yet, skipping");
-            return Ok(None);
+            return Ok(AcquisitionDecision::Pending);
         };
 
         if !self.criteria.matches(&metrics) {
             debug!(
                 symbol = listing.symbol.as_str(),
                 volume = %metrics.volume_24h,
-                "does not meet acquisition criteria, skipping"
+                "does not meet acquisition criteria yet; retaining for pending retry"
             );
-            return Ok(None);
+            return Ok(AcquisitionDecision::Pending);
         }
 
         if let Some(gate) = &self.safety_gate {
             let Some(report) = gate.checker.assess(&listing.symbol).await? else {
                 debug!(symbol = listing.symbol.as_str(), "no safety assessment yet, skipping");
-                return Ok(None);
+                return Ok(AcquisitionDecision::Pending);
             };
 
             if !gate.criteria.passes(&report) {
                 info!(
                     symbol = listing.symbol.as_str(),
-                    sell_tax_bps = report.sell_tax_bps,
+                    sell_tax_bps = ?report.sell_tax_bps,
                     ownership_renounced = report.ownership_renounced,
                     liquidity_locked = report.liquidity_locked,
                     is_mintable = report.is_mintable,
                     "failed safety check, skipping (likely honeypot/rug signal)"
                 );
-                return Ok(None);
+                return Ok(AcquisitionDecision::Rejected);
             }
         }
 
@@ -122,7 +131,7 @@ impl AcquisitionEngine {
                 canonical_id = %canonical_id,
                 "already acquired via another source, skipping"
             );
-            return Ok(None);
+            return Ok(AcquisitionDecision::Rejected);
         }
 
         let filled = match self.exchange.submit_buy_by_amount(&listing.symbol, self.position_size).await {
@@ -153,7 +162,7 @@ impl AcquisitionEngine {
             self.take_profit,
         );
 
-        Ok(Some(position))
+        Ok(AcquisitionDecision::Opened(position))
     }
 
     async fn release_reservation(&self, canonical_id: &CanonicalTokenId) {
@@ -300,8 +309,34 @@ mod tests {
             .await
             .expect("stub dependencies cannot fail");
 
-        assert!(result.is_some());
+        assert!(matches!(result, AcquisitionDecision::Opened(_)));
         assert_eq!(*exchange.buys_submitted.lock().await, 1);
+    }
+
+    #[tokio::test]
+    async fn retains_a_listing_when_volume_is_below_the_threshold() {
+        let exchange = Arc::new(StubExchange {
+            buys_submitted: Mutex::new(0),
+            fail_buy: false,
+        });
+        let metrics = ListingMetrics {
+            volume_24h: Decimal::from(10),
+            market_cap: Decimal::from(100_000),
+        };
+        let engine = build_engine(
+            Some(metrics),
+            None,
+            exchange.clone(),
+            Arc::new(InMemoryLedger::empty()),
+        );
+
+        let result = engine
+            .evaluate_and_buy(&sample_listing())
+            .await
+            .expect("stub dependencies cannot fail");
+
+        assert!(matches!(result, AcquisitionDecision::Pending));
+        assert_eq!(*exchange.buys_submitted.lock().await, 0);
     }
 
     #[tokio::test]
@@ -311,7 +346,7 @@ mod tests {
             fail_buy: false,
         });
         let dangerous_report = SafetyReport {
-            sell_tax_bps: 9_000,
+            sell_tax_bps: Some(9_000),
             ownership_renounced: false,
             liquidity_locked: false,
             is_mintable: true,
@@ -327,7 +362,7 @@ mod tests {
             .await
             .expect("stub dependencies cannot fail");
 
-        assert!(result.is_none());
+        assert!(matches!(result, AcquisitionDecision::Rejected));
         assert_eq!(*exchange.buys_submitted.lock().await, 0);
     }
 
@@ -354,8 +389,8 @@ mod tests {
             .await
             .expect("stub dependencies cannot fail");
 
-        assert!(first.is_some());
-        assert!(second.is_none());
+        assert!(matches!(first, AcquisitionDecision::Opened(_)));
+        assert!(matches!(second, AcquisitionDecision::Rejected));
         assert_eq!(*exchange.buys_submitted.lock().await, 1);
     }
 

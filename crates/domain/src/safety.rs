@@ -9,11 +9,10 @@ use serde::{Deserialize, Serialize};
 /// `SafetyGate` is actually configured for a venue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SafetyReport {
-    /// Sell tax in basis points (100 = 1%). A high, unverifiable, or
-    /// "can't even simulate a sell" tax is the single strongest honeypot
-    /// signal - it's usually the actual mechanism a honeypot contract
-    /// uses to trap buyers.
-    pub sell_tax_bps: u32,
+    /// Sell tax in basis points (100 = 1%). `None` means the checker could
+    /// not verify a sell tax. Unknown must remain distinct from a measured
+    /// zero so the safety gate cannot accidentally fail open.
+    pub sell_tax_bps: Option<u32>,
     /// Whether contract ownership has been renounced (no admin function
     /// left that could rug the token after purchase).
     pub ownership_renounced: bool,
@@ -43,7 +42,10 @@ impl SafetyCriteria {
     }
 
     pub fn passes(&self, report: &SafetyReport) -> bool {
-        if report.sell_tax_bps > self.max_sell_tax_bps {
+        let Some(sell_tax_bps) = report.sell_tax_bps else {
+            return false;
+        };
+        if sell_tax_bps > self.max_sell_tax_bps {
             return false;
         }
         if report.is_mintable {
@@ -62,7 +64,7 @@ mod tests {
 
     fn safe_report() -> SafetyReport {
         SafetyReport {
-            sell_tax_bps: 200,
+            sell_tax_bps: Some(200),
             ownership_renounced: true,
             liquidity_locked: true,
             is_mintable: false,
@@ -79,7 +81,17 @@ mod tests {
     fn rejects_sell_tax_above_threshold() {
         let criteria = SafetyCriteria::new(500);
         let report = SafetyReport {
-            sell_tax_bps: 900,
+            sell_tax_bps: Some(900),
+            ..safe_report()
+        };
+        assert!(!criteria.passes(&report));
+    }
+
+    #[test]
+    fn rejects_unknown_sell_tax() {
+        let criteria = SafetyCriteria::new(1_000);
+        let report = SafetyReport {
+            sell_tax_bps: None,
             ..safe_report()
         };
         assert!(!criteria.passes(&report));

@@ -17,8 +17,9 @@ detection, real volume filtering (DexScreener), a real safety gate
 can autonomously spend real funds.** See "Automation & execution
 platforms" for exactly what's verified vs. best-effort in each piece,
 and read every module doc comment it points to before funding a
-wallet. EVM execution is detection-only still - see "Not yet
-implemented."
+wallet. EVM now has real Alloy-based execution, private-RPC submission,
+DexScreener metrics, and Honeypot.is sell simulation. Live EVM execution
+requires an `EVM_PRIVATE_KEY` plus a configured private RPC.
 
 ## Architecture
 
@@ -76,6 +77,29 @@ ceiling at all. Aggregator APIs are still useful, just for a different
 job: enriching a listing with metrics once it exists (this is exactly
 what `MetricsProvider` is for), not for discovering it in the first
 place.
+
+### Pending listings and delayed indexers
+
+A listing can be detected on-chain before DexScreener has indexed it, and a
+listing can also be indexed while its 24h volume is still below the acquisition
+threshold. Those states are **pending**, not rejected.
+
+Each listing source persists its pending candidates alongside its normal cursor
+and seen-key state. The runner retries pending candidates every
+`risk.pending_listing_retry_seconds` seconds. A pending candidate gets a full
+24-hour retry window starting when it enters the pending queue. During that
+window, a token that later becomes indexed or later reaches the required volume
+can still be bought, subject to the normal safety gate and all entry
+guardrails.
+
+Only a definitive rejection, a successful acquisition, or expiry of the
+24-hour window removes a candidate from pending. The `seen_keys` set is kept
+separate, so expiring a candidate prevents it from being rediscovered by a
+full-snapshot source while still allowing the source's cursor to advance.
+
+The state format also accepts the previous pending-listing representation on
+load, using the listing's original `first_seen` timestamp as the migration
+start time.
 
 ### Cross-source deduplication: `CanonicalTokenId` + `AcquisitionLedger`
 
@@ -239,8 +263,10 @@ at three different confidence levels, and it matters which is which:**
   `mintAuthority`/`freezeAuthority` field names are independently
   corroborated by two sources. Liquidity-lock detection is best-effort.
   **Sell-tax detection is not meaningfully implemented** - RugCheck
-  doesn't appear to expose it, so `sell_tax_bps` is always `0`, which
-  means *unverified*, not confirmed-safe. There's also a residual risk
+  doesn't appear to expose it, so `sell_tax_bps` is represented as
+  `None`, which means *unverified* and is now rejected by the safety
+  gate rather than being treated as confirmed zero tax. There's also a
+  residual risk
   worth naming directly: if the two authority field names turn out to be
   wrong, they'd silently read as "renounced" (safe) rather than erroring
   - fail-*open*, the opposite of this codebase's usual default. One
@@ -271,23 +297,33 @@ inline equivalent; every call site was checked for idempotency first
 resubmitting an identical signed transaction is safe on Solana
 specifically, unlike most payment-style APIs).
 
+**Entry-side operational guardrails are now also enforced in the runner.**
+New buys pause when the operator creates `state/STOP_ENTRIES`, when the
+configured concurrent-position cap is full, when one poll cycle produces
+anomalously many new listings, or when consecutive operational failures
+trip the circuit breaker. Existing positions continue through their normal
+exit checks while new entries are paused.
+
 **Consolidated risk summary, because this is the round where the bot
 became capable of spending real funds:** (1) the signing code in
-`execution.rs` is built on solana-sdk primitives unverified against the
-current pinned version - read that module's doc comment; (2) RugCheck's
-safety gate has a real fail-open risk if its field-name assumptions are
-wrong, and doesn't check sell-tax at all; (3) nothing here has been
-compiled or run, this environment has no network or Rust toolchain.
-Start with the smallest `max_position_size` you're willing to lose
-entirely, watch the logs (`RUST_LOG=debug`), and watch the wallet
-address on a block explorer during the first several trades.
+`execution.rs` is pinned to the current `solana-sdk` 4.1.0 shape and now
+validates the returned transaction before signing; (2) RugCheck's
+ability to verify sell-tax is still absent, and the safety gate now
+fails closed on an unknown sell-tax value; (3) an explicit
+`simulateTransaction` preflight now runs before signing, while the
+transaction is still unsigned; (4) this environment still has no Rust
+toolchain because Debian package index access is unavailable. Start
+with the smallest `max_position_size` you're willing to lose entirely,
+watch the logs (`RUST_LOG=debug`), and watch the wallet address on a
+block explorer during the first several trades.
 
-**EVM - not started.** [Alloy](https://alloy.rs) for building/signing
-transactions (ethers-rs, mentioned earlier in this project, is now
-officially deprecated in favor of Alloy) - either calling a DEX router
-directly or going through a price aggregator (0x/1inch) for better
-routing, submitted via Flashbots Protect (Ethereum) or the equivalent
-private RPC per chain for sandwich protection.
+**EVM execution is now wired.** Alloy builds and locally signs
+Uniswap-V2-compatible native-coin buys and token sells. Every write is
+simulated before signing, and the signed EIP-2718 transaction is submitted
+through the configured private RPC. The adapter verifies the connected chain
+ID before execution. EVM safety uses Honeypot.is buy/sell simulation and
+requires a successful simulation, no honeypot verdict, low scanner risk,
+verified root source, and a measured sell tax below the configured limit.
 
 ## Continuous integration
 
@@ -339,23 +375,19 @@ to a real, funded wallet's key.**
 
 ## Not yet implemented
 
-- **Real sell-tax detection.** `RugCheckSafetyChecker` always reports
-  `sell_tax_bps = 0` - not because it's confirmed zero, but because
-  RugCheck doesn't appear to expose this and no sell-simulation-based
-  check has been built. If this matters for your risk tolerance, don't
-  rely on `SafetyCriteria`'s tax check via this checker alone.
-- **EVM trade execution and safety/metrics data.** Alloy + a
-  router/aggregator + Flashbots Protect for execution (per "Automation &
-  execution platforms"); `MetricsProvider`/`TokenSafetyChecker` for EVM
-  are still `None`-always placeholders. None of this has been started.
+- **Real sell-tax detection.** `RugCheckSafetyChecker` does not expose a
+  verified sell-tax value, so it reports `sell_tax_bps = None`. The safety
+  gate treats that as unknown and rejects the listing. A real sell
+  simulation is still required before Solana purchases can pass this gate.
+- **EVM routing beyond Uniswap-V2-compatible routers.** The current live EVM
+  path deliberately uses a configured V2-compatible router and native-coin
+  paths. An aggregator integration can be added later without changing the
+  application ports.
 - **Wallet secrets management.** `SOLANA_PRIVATE_KEY` is read directly
   from the environment - fine for a single trusted deployment, not for
   production secrets hygiene. A real deployment wants this from a
   secrets manager (Vault, AWS Secrets Manager, etc.), ideally with an
   HSM, and a hot wallet capped to what you can afford to lose regardless.
-- **Circuit breaker / kill switch.** No global cap on concurrent open
-  positions, no auto-pause on repeated failures or an unusually large
-  burst of listings (often signals a spoofed feed).
 - **Multi-instance ledger/position-store coordination.** Both
   `AcquisitionLedger` and `PositionStore` are atomic within one running
   process only - not across multiple bot instances sharing the same
@@ -363,9 +395,6 @@ to a real, funded wallet's key.**
 - **EVM `topic0` values.** Not hardcoded anywhere on purpose - see
   `ben_snipes-adapter-evm-onchain`'s crate docs for why, and what to do
   instead before enabling a chain.
-- **Transaction simulation before signing.** A pre-flight
-  `simulateTransaction` check would catch some failures before spending
-  a real fee attempting them - not implemented.
 - **`retry.rs`'s closure-capture pattern needs a compiler to confirm.**
   `with_retry(3, || async { ... })` - no `move` on either layer - is
   used at three call sites (`execute_trade`'s HTTP request,
