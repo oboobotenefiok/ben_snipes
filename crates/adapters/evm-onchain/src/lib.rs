@@ -19,7 +19,7 @@ use alloy::{
 use async_trait::async_trait;
 use ben_snipes_adapter_ws_support::connect_with_backoff;
 use ben_snipes_domain::{
-    Chain, DomainError, FilledBuy, Listing, ListingMetrics, Order, OrderSide, OrderStatus,
+    Chain, DomainError, FilledBuy, Listing, ListingMetrics, Order, OrderSide,
     SafetyReport, Symbol, Venue, VenueKind,
 };
 use ben_snipes_ports::{
@@ -343,7 +343,7 @@ pub struct EvmUniswapV2Exchange {
     router: Address,
     wrapped_native: Address,
     slippage_percent: u32,
-    signer: PrivateKeySigner,
+    signer: Option<PrivateKeySigner>,
 }
 
 impl EvmUniswapV2Exchange {
@@ -363,7 +363,36 @@ impl EvmUniswapV2Exchange {
         let router = router.parse::<Address>().map_err(|e| format!("invalid router address: {e}"))?;
         let wrapped_native = wrapped_native.parse::<Address>().map_err(|e| format!("invalid wrapped native address: {e}"))?;
         if slippage_percent >= 100 { return Err("EVM slippage_percent must be below 100".to_string()); }
-        Ok(Self { chain_id, execution_rpc_url, private_rpc_url, router, wrapped_native, slippage_percent, signer })
+        Ok(Self { chain_id, execution_rpc_url, private_rpc_url, router, wrapped_native, slippage_percent, signer: Some(signer) })
+    }
+
+    pub fn read_only(
+        chain_id: u64,
+        execution_rpc_url: String,
+        router: &str,
+        wrapped_native: &str,
+        slippage_percent: u32,
+    ) -> Result<Self, String> {
+        let router = router.parse::<Address>().map_err(|e| format!("invalid router address: {e}"))?;
+        let wrapped_native = wrapped_native.parse::<Address>().map_err(|e| format!("invalid wrapped native address: {e}"))?;
+        if slippage_percent >= 100 {
+            return Err("EVM slippage_percent must be below 100".to_string());
+        }
+        Ok(Self {
+            chain_id,
+            execution_rpc_url,
+            private_rpc_url: None,
+            router,
+            wrapped_native,
+            slippage_percent,
+            signer: None,
+        })
+    }
+
+    fn signer(&self) -> Result<&PrivateKeySigner, PortError> {
+        self.signer.as_ref().ok_or_else(|| {
+            PortError::Rejected("EVM exchange is configured read-only; live execution is disabled".to_string())
+        })
     }
 
     async fn provider(&self) -> Result<impl Provider + Clone, PortError> {
@@ -402,14 +431,15 @@ impl EvmUniswapV2Exchange {
         let chain_id = provider.get_chain_id().await.map_err(|e| PortError::Network {
             venue: "evm-rpc".to_string(), source: Box::new(e),
         })?;
-        let nonce = provider.get_transaction_count(self.signer.address()).await.map_err(|e| PortError::Network {
+        let signer = self.signer()?;
+        let nonce = provider.get_transaction_count(signer.address()).await.map_err(|e| PortError::Network {
             venue: "evm-rpc".to_string(), source: Box::new(e),
         })?;
         let fees = provider.estimate_eip1559_fees().await.map_err(|e| PortError::Network {
             venue: "evm-rpc".to_string(), source: Box::new(e),
         })?;
         let unsigned = TransactionRequest::default()
-            .with_from(self.signer.address())
+            .with_from(signer.address())
             .with_to(to)
             .with_value(value)
             .with_input(input)
@@ -419,7 +449,7 @@ impl EvmUniswapV2Exchange {
             .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
         let gas_limit = provider.estimate_gas(unsigned.clone()).await.map_err(|e| PortError::Rejected(format!("EVM transaction gas estimation failed: {e}")))?;
         let required_balance = value.saturating_add(U256::from(gas_limit).saturating_mul(U256::from(fees.max_fee_per_gas)));
-        let balance = provider.get_balance(self.signer.address()).await.map_err(|e| PortError::Network {
+        let balance = provider.get_balance(signer.address()).await.map_err(|e| PortError::Network {
             venue: "evm-rpc".to_string(), source: Box::new(e),
         })?;
         if balance < required_balance {
@@ -427,7 +457,7 @@ impl EvmUniswapV2Exchange {
         }
         let unsigned = unsigned.with_gas_limit(gas_limit);
         provider.call(unsigned.clone()).await.map_err(|e| PortError::Rejected(format!("EVM transaction preflight failed: {e}")))?;
-        let wallet = EthereumWallet::from(self.signer.clone());
+        let wallet = EthereumWallet::from(signer.clone());
         let signed = unsigned.build(&wallet).await.map_err(|e| PortError::Rejected(format!("EVM local signing failed: {e}")))?;
         let encoded = signed.encoded_2718();
         let pending = private_provider.send_raw_transaction(&encoded).await.map_err(|e| PortError::Network {
@@ -497,7 +527,7 @@ impl ExchangeClient for EvmUniswapV2Exchange {
     async fn submit_buy_by_amount(&self, symbol: &Symbol, quote_amount: Decimal) -> Result<FilledBuy, PortError> {
         let token = symbol.as_str().parse::<Address>().map_err(|e| PortError::Rejected(format!("invalid EVM token address: {e}")))?;
         let provider = self.provider().await?;
-        let wallet = self.signer.address();
+        let wallet = self.signer()?.address();
         let value = Self::native_to_wei(quote_amount)?;
         let router = UniswapV2Router::new(self.router, &provider);
         let quote = router.getAmountsOut(value, vec![self.wrapped_native, token]).call().await
@@ -520,21 +550,23 @@ impl ExchangeClient for EvmUniswapV2Exchange {
         Ok(FilledBuy { quantity, entry_price })
     }
 
-    async fn submit_order(&self, order: Order) -> Result<Order, PortError> {
+    async fn submit_order(&self, order: Order) -> Result<FilledSell, PortError> {
         if order.side != OrderSide::Sell { return Err(PortError::Rejected("EVM submit_order only supports sell orders".to_string())); }
         let token = order.symbol.as_str().parse::<Address>().map_err(|e| PortError::Rejected(format!("invalid EVM token address: {e}")))?;
         let provider = self.provider().await?;
-        let wallet = self.signer.address();
+        let wallet = self.signer()?.address();
         let decimals = self.token_decimals(&provider, token).await?;
         let amount = Self::token_to_raw(order.quantity, decimals)?;
         let router = UniswapV2Router::new(self.router, &provider);
         let allowance = Erc20::new(token, &provider).allowance(wallet, self.router).call().await
             .map_err(|e| PortError::Rejected(format!("failed to read token allowance: {e}")))?;
+        let mut fee_quote = Decimal::ZERO;
         if allowance < amount {
             let approve = Erc20::new(token, &provider).approve(self.router, amount);
             approve.call().await.map_err(|e| PortError::Rejected(format!("token approval preflight failed: {e}")))?;
             let approval_receipt = self.send_private_transaction(&provider, token, U256::ZERO, approve.calldata().to_owned()).await?;
             if !approval_receipt.status() { return Err(PortError::Rejected("token approval transaction reverted".to_string())); }
+            fee_quote += Self::native_from_wei(U256::from(approval_receipt.cost()))?;
         }
         let quote = router.getAmountsOut(amount, vec![token, self.wrapped_native]).call().await
             .map_err(|e| PortError::Rejected(format!("EVM sell quote failed: {e}")))?;
@@ -544,9 +576,14 @@ impl ExchangeClient for EvmUniswapV2Exchange {
         let call = router.swapExactTokensForETHSupportingFeeOnTransferTokens(amount, min_out, vec![token, self.wrapped_native], wallet, deadline);
         let receipt = self.send_private_transaction(&provider, self.router, U256::ZERO, call.calldata().to_owned()).await?;
         if !receipt.status() { return Err(PortError::Rejected("EVM sell transaction reverted".to_string())); }
-        let mut filled = order;
-        filled.status = OrderStatus::Filled;
-        Ok(filled)
+        fee_quote += Self::native_from_wei(U256::from(receipt.cost()))?;
+        Ok(FilledSell {
+            quantity: order.quantity,
+            execution_price: None,
+            quote_proceeds: None,
+            fee_quote: Some(fee_quote),
+            tx_id: Some(format!("{}", receipt.transaction_hash)),
+        })
     }
 }
 
@@ -561,7 +598,7 @@ impl ExchangeClient for NoWalletEvmExchange {
     async fn submit_buy_by_amount(&self, _symbol: &Symbol, _quote_amount: Decimal) -> Result<FilledBuy, PortError> {
         Err(PortError::Rejected("EVM wallet is not configured".to_string()))
     }
-    async fn submit_order(&self, _order: Order) -> Result<Order, PortError> {
+    async fn submit_order(&self, _order: Order) -> Result<FilledSell, PortError> {
         Err(PortError::Rejected("EVM wallet is not configured".to_string()))
     }
 }

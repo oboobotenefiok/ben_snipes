@@ -28,7 +28,7 @@ use crate::execution::{execute_trade, TradeAction, TradeRequest};
 use crate::price_feed;
 use crate::retry::with_retry;
 use async_trait::async_trait;
-use ben_snipes_domain::{FilledBuy, Order, OrderSide, OrderStatus, Symbol};
+use ben_snipes_domain::{FilledBuy, FilledSell, Order, OrderSide, Symbol};
 use ben_snipes_ports::{ExchangeClient, PortError};
 use rust_decimal::Decimal;
 use solana_sdk::signer::keypair::Keypair;
@@ -53,7 +53,7 @@ const FEE_BUFFER_LAMPORTS: u64 = 5_000_000; // 0.005 SOL
 
 pub struct PumpPortalExchangeClient {
     http: reqwest::Client,
-    wallet: Keypair,
+    wallet: Option<Keypair>,
     rpc_url: String,
     slippage_percent: u32,
     priority_fee_sol: Decimal,
@@ -63,11 +63,27 @@ impl PumpPortalExchangeClient {
     pub fn new(wallet: Keypair, rpc_url: impl Into<String>, slippage_percent: u32, priority_fee_sol: Decimal) -> Self {
         Self {
             http: reqwest::Client::new(),
-            wallet,
+            wallet: Some(wallet),
             rpc_url: rpc_url.into(),
             slippage_percent,
             priority_fee_sol,
         }
+    }
+
+    pub fn new_read_only(rpc_url: impl Into<String>) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            wallet: None,
+            rpc_url: rpc_url.into(),
+            slippage_percent: 0,
+            priority_fee_sol: Decimal::ZERO,
+        }
+    }
+
+    fn wallet(&self) -> Result<&Keypair, PortError> {
+        self.wallet.as_ref().ok_or_else(|| {
+            PortError::Rejected("Solana exchange is configured read-only; live execution is disabled".to_string())
+        })
     }
 
     async fn wait_for_confirmation(&self, signature: &str) -> Result<(), PortError> {
@@ -142,7 +158,7 @@ impl PumpPortalExchangeClient {
                 "id": 1,
                 "method": "getTokenAccountsByOwner",
                 "params": [
-                    self.wallet.pubkey().to_string(),
+                    self.wallet()?.pubkey().to_string(),
                     { "mint": mint },
                     { "encoding": "jsonParsed" },
                 ],
@@ -161,6 +177,10 @@ impl PumpPortalExchangeClient {
                 .json()
                 .await
                 .map_err(|e| format!("failed to parse balance response: {e}"))?;
+
+            if json.pointer("/result/value").and_then(|v| v.as_array()).is_some_and(|accounts| accounts.is_empty()) {
+                return Ok(Decimal::ZERO);
+            }
 
             let token_amount = json.pointer("/result/value/0/account/data/parsed/info/tokenAmount");
 
@@ -187,7 +207,7 @@ impl PumpPortalExchangeClient {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "getBalance",
-                "params": [self.wallet.pubkey().to_string()],
+                "params": [self.wallet()?.pubkey().to_string()],
             });
 
             let response = self
@@ -214,6 +234,113 @@ impl PumpPortalExchangeClient {
                 .ok_or_else(|| format!("no balance in RPC response: {json}"))?;
 
             Ok(Decimal::from(lamports) / Decimal::from(LAMPORTS_PER_SOL))
+        })
+        .await
+        .map_err(PortError::Rejected)
+    }
+}
+
+impl PumpPortalExchangeClient {
+    /// Reads the confirmed transaction metadata and derives the wallet's
+    /// actual SOL settlement from the fee-payer balance delta. The gross
+    /// proceeds are reconstructed as the wallet balance increase plus the
+    /// transaction fee, while the fee is returned separately. This avoids
+    /// treating a pre-trade price quote as a fill.
+    async fn solana_settlement(&self, signature: &str) -> Result<(Decimal, Decimal), PortError> {
+        with_retry(3, || async {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTransaction",
+                "params": [
+                    signature,
+                    {
+                        "encoding": "jsonParsed",
+                        "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": 0,
+                    }
+                ],
+            });
+
+            let response = self
+                .http
+                .post(&self.rpc_url)
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .map_err(|e| format!("transaction lookup failed: {e}"))?;
+
+            let json: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| format!("failed to parse transaction response: {e}"))?;
+
+            if let Some(error) = json.get("error") {
+                return Err(format!("transaction lookup RPC returned an error: {error}"));
+            }
+
+            let result = json
+                .get("result")
+                .and_then(|value| value.as_object())
+                .ok_or_else(|| "confirmed transaction metadata was not available".to_string())?;
+
+            let meta = result
+                .get("meta")
+                .and_then(|value| value.as_object())
+                .ok_or_else(|| "confirmed transaction had no metadata".to_string())?;
+
+            let fee_lamports = meta
+                .get("fee")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| "confirmed transaction metadata had no fee".to_string())?;
+
+            let pre_balances = meta
+                .get("preBalances")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| "confirmed transaction metadata had no preBalances".to_string())?;
+            let post_balances = meta
+                .get("postBalances")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| "confirmed transaction metadata had no postBalances".to_string())?;
+
+            if pre_balances.is_empty() || pre_balances.len() != post_balances.len() {
+                return Err("confirmed transaction balance metadata was incomplete".to_string());
+            }
+
+            // PumpPortal constructs the wallet as the fee payer. Solana's
+            // transaction message therefore places it at account index 0.
+            // We validate that assumption against the returned account key
+            // before trusting the balance delta.
+            let first_account = result
+                .get("transaction")
+                .and_then(|value| value.get("message"))
+                .and_then(|value| value.get("accountKeys"))
+                .and_then(|value| value.as_array())
+                .and_then(|keys| keys.first())
+                .and_then(|key| key.get("pubkey"))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "confirmed transaction did not expose its fee payer".to_string())?;
+
+            if first_account != self.wallet()?.pubkey().to_string() {
+                return Err("confirmed transaction fee payer did not match configured wallet".to_string());
+            }
+
+            let pre = pre_balances[0]
+                .as_u64()
+                .ok_or_else(|| "invalid pre-transaction wallet balance".to_string())?;
+            let post = post_balances[0]
+                .as_u64()
+                .ok_or_else(|| "invalid post-transaction wallet balance".to_string())?;
+
+            let net_change = Decimal::from(post) - Decimal::from(pre);
+            let fee = Decimal::from(fee_lamports);
+            let gross_proceeds = net_change + fee;
+
+            Ok((
+                gross_proceeds / Decimal::from(LAMPORTS_PER_SOL),
+                fee / Decimal::from(LAMPORTS_PER_SOL),
+            ))
         })
         .await
         .map_err(PortError::Rejected)
@@ -257,6 +384,8 @@ impl ExchangeClient for PumpPortalExchangeClient {
             )));
         }
 
+        let previous_quantity = self.token_balance(symbol.as_str()).await?;
+
         let request = TradeRequest {
             action: TradeAction::Buy,
             mint: symbol.as_str().to_string(),
@@ -265,13 +394,14 @@ impl ExchangeClient for PumpPortalExchangeClient {
             priority_fee_sol: self.priority_fee_sol,
         };
 
-        let signature = execute_trade(&self.http, &self.wallet, &self.rpc_url, &request)
+        let signature = execute_trade(&self.http, self.wallet()?, &self.rpc_url, &request)
             .await
             .map_err(PortError::Rejected)?;
 
         self.wait_for_confirmation(&signature).await?;
 
-        let quantity = self.token_balance(symbol.as_str()).await?;
+        let current_quantity = self.token_balance(symbol.as_str()).await?;
+        let quantity = current_quantity - previous_quantity;
         if quantity <= Decimal::ZERO {
             return Err(PortError::Rejected(
                 "buy confirmed on-chain but resulting token balance was zero or unreadable".to_string(),
@@ -284,7 +414,7 @@ impl ExchangeClient for PumpPortalExchangeClient {
         })
     }
 
-    async fn submit_order(&self, order: Order) -> Result<Order, PortError> {
+    async fn submit_order(&self, order: Order) -> Result<FilledSell, PortError> {
         if order.side != OrderSide::Sell {
             return Err(PortError::Rejected(
                 "PumpPortalExchangeClient buys go through submit_buy_by_amount, not submit_order".to_string(),
@@ -299,14 +429,34 @@ impl ExchangeClient for PumpPortalExchangeClient {
             priority_fee_sol: self.priority_fee_sol,
         };
 
-        let signature = execute_trade(&self.http, &self.wallet, &self.rpc_url, &request)
+        let previous_quantity = self.token_balance(order.symbol.as_str()).await?;
+
+        let signature = execute_trade(&self.http, self.wallet()?, &self.rpc_url, &request)
             .await
             .map_err(PortError::Rejected)?;
 
         self.wait_for_confirmation(&signature).await?;
 
-        let mut filled = order;
-        filled.status = OrderStatus::Filled;
-        Ok(filled)
+        let current_quantity = self.token_balance(order.symbol.as_str()).await?;
+        let sold_quantity = previous_quantity - current_quantity;
+        if sold_quantity <= Decimal::ZERO {
+            return Err(PortError::Rejected(
+                "sell transaction confirmed but token balance did not decrease".to_string(),
+            ));
+        }
+
+        let (quote_proceeds, fee_quote) = self.solana_settlement(&signature).await?;
+
+        Ok(FilledSell {
+            quantity: sold_quantity,
+            execution_price: if sold_quantity > Decimal::ZERO {
+                Some(quote_proceeds / sold_quantity)
+            } else {
+                None
+            },
+            quote_proceeds: Some(quote_proceeds),
+            fee_quote: Some(fee_quote),
+            tx_id: Some(signature),
+        })
     }
 }

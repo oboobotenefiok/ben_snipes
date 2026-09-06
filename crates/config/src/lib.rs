@@ -14,6 +14,23 @@ pub enum ConfigError {
     Load(#[from] config::ConfigError),
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionMode {
+    /// Detection and real execution when wallets are configured.
+    Live,
+    /// Run the complete strategy with real market data but simulate orders.
+    Paper,
+    /// Detect and evaluate listings, but never attempt acquisition or exits.
+    DetectionOnly,
+}
+
+impl Default for ExecutionMode {
+    fn default() -> Self {
+        Self::Live
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiskConfig {
     /// Take-profit target as a percentage above entry price, e.g. 10.0
@@ -55,6 +72,19 @@ pub struct SafetyConfig {
     /// DEX listing to pass the honeypot/rug safety gate. Only applies to
     /// venues that have a `SafetyGate` configured - see the README.
     pub max_sell_tax_bps: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ObservabilityConfig {
+    /// Local HTTP bind address for the Prometheus-compatible `/metrics`
+    /// endpoint. Keep this on loopback unless access control is provided
+    /// by the deployment environment.
+    #[serde(default = "default_metrics_bind")]
+    pub metrics_bind: String,
+}
+
+fn default_metrics_bind() -> String {
+    "127.0.0.1:9090".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,8 +160,12 @@ fn default_evm_slippage_percent() -> u32 { 10 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub execution_mode: ExecutionMode,
     pub risk: RiskConfig,
     pub safety: SafetyConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
     pub storage: StorageConfig,
     pub solana: SolanaConfig,
     /// Zero or more EVM chains to watch - one `EvmFactoryLogSource` gets

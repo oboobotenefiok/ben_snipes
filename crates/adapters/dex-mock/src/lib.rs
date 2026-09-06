@@ -12,7 +12,7 @@
 
 use async_trait::async_trait;
 use ben_snipes_domain::{
-    Chain, FilledBuy, Listing, ListingMetrics, Order, OrderStatus, SafetyReport, Symbol, Venue,
+    Chain, FilledBuy, Listing, ListingMetrics, Order, SafetyReport, Symbol, Venue,
     VenueKind,
 };
 use ben_snipes_ports::{
@@ -149,12 +149,15 @@ impl ExchangeClient for MockDexClient {
         })
     }
 
-    async fn submit_order(&self, mut order: Order) -> Result<Order, PortError> {
-        // A real adapter would build, sign, and broadcast an on-chain
-        // transaction here, ideally through a private relay to avoid
-        // getting sandwiched. See the README for why that matters.
-        order.status = OrderStatus::Filled;
-        Ok(order)
+    async fn submit_order(&self, order: Order) -> Result<FilledSell, PortError> {
+        let price = *self.price.lock().await;
+        Ok(FilledSell {
+            quantity: order.quantity,
+            execution_price: Some(price),
+            quote_proceeds: Some(price * order.quantity),
+            fee_quote: None,
+            tx_id: Some("mock-dex-tx".to_string()),
+        })
     }
 }
 

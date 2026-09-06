@@ -61,6 +61,22 @@ pub struct FilledBuy {
     pub entry_price: Decimal,
 }
 
+/// Settlement metadata returned after a quantity-based sell.
+///
+/// DEXes do not always expose the final quote proceeds through the same
+/// interface that submits the transaction, so exact settlement fields are
+/// optional. A transaction id is still recorded whenever the venue exposes
+/// one, which makes the journal auditable without pretending a pre-trade
+/// quote was an on-chain fill.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FilledSell {
+    pub quantity: Decimal,
+    pub execution_price: Option<Decimal>,
+    pub quote_proceeds: Option<Decimal>,
+    pub fee_quote: Option<Decimal>,
+    pub tx_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

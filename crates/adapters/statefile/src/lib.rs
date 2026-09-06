@@ -16,8 +16,10 @@ use tracing::debug;
 
 mod ledger;
 mod position_store;
+mod trade_store;
 pub use ledger::FileAcquisitionLedger;
 pub use position_store::FilePositionStore;
+pub use trade_store::{FilePendingTradeStore, FileTradeStore};
 
 pub struct StatefileStore {
     directory: PathBuf,

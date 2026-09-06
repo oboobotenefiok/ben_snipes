@@ -203,7 +203,7 @@ impl ExchangeClient for NoWalletExchange {
         ))
     }
 
-    async fn submit_order(&self, _order: Order) -> Result<Order, PortError> {
+    async fn submit_order(&self, _order: Order) -> Result<FilledSell, PortError> {
         Err(PortError::Rejected(
             "no wallet configured (SOLANA_PRIVATE_KEY not set) - see execution module docs".to_string(),
         ))

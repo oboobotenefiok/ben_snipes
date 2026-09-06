@@ -11,6 +11,7 @@ members = [
     "crates/adapters/pumpfun",
     "crates/adapters/evm-onchain",
     "bin/runner",
+    "bin/backtest",
 ]
 
 # Centralising versions here means every crate in the workspace pulls the

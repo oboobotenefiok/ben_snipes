@@ -1,6 +1,6 @@
 use crate::PortError;
 use async_trait::async_trait;
-use ben_snipes_domain::{FilledBuy, Order, Symbol};
+use ben_snipes_domain::{FilledBuy, FilledSell, Order, Symbol};
 use rust_decimal::Decimal;
 
 /// Trading operations against a single venue. A CEX adapter implements
@@ -30,12 +30,10 @@ pub trait ExchangeClient: Send + Sync {
     /// it.
     async fn submit_buy_by_amount(&self, symbol: &Symbol, quote_amount: Decimal) -> Result<FilledBuy, PortError>;
 
-    /// Submit an order and return it with the venue's response applied
-    /// (fill status, etc). In practice this is the exit/sell path - the
-    /// quantity being sold is already known (it's the position being
-    /// closed), which is why selling stays quantity-based even on
-    /// venues where buying is amount-based. Implementations are
-    /// responsible for their own slippage/gas handling internally - the
-    /// port only cares about intent in, result out.
-    async fn submit_order(&self, order: Order) -> Result<Order, PortError>;
+    /// Submit an order and return settlement metadata for the resulting sell.
+    /// The quantity being sold is already known, while execution price,
+    /// proceeds, fees, and transaction id depend on the venue and may be
+    /// partially unavailable. Implementations must never fabricate missing
+    /// settlement fields.
+    async fn submit_order(&self, order: Order) -> Result<FilledSell, PortError>;
 }

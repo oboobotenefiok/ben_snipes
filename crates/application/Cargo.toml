@@ -10,8 +10,9 @@ ben_snipes-domain = { workspace = true }
 ben_snipes-ports = { workspace = true }
 tracing = { workspace = true }
 rust_decimal = { workspace = true }
+time = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
-time = { workspace = true }

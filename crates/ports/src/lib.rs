@@ -17,6 +17,7 @@ mod metrics_provider;
 mod position_store;
 mod state_store;
 mod token_safety_checker;
+mod trade_store;
 
 pub use acquisition_ledger::AcquisitionLedger;
 pub use clock::Clock;
@@ -27,3 +28,4 @@ pub use metrics_provider::MetricsProvider;
 pub use position_store::PositionStore;
 pub use state_store::{KnownListings, ListingStateStore, PendingListing};
 pub use token_safety_checker::TokenSafetyChecker;
+pub use trade_store::{PendingTradeStore, TradeStore};

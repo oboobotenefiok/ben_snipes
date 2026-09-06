@@ -1,3 +1,8 @@
+# live submits real transactions when wallets and private execution endpoints are configured.
+# paper uses real market data but never signs or submits trades.
+# detection_only observes listings and evaluates them without entering or exiting.
+execution_mode = "live"
+
 [risk]
 # The only exit condition - no stop-loss, by design. A position is held
 # until it hits this target, however long that takes.
@@ -81,3 +86,8 @@ priority_fee_sol = "0.0001"
 # wrapped_native_address = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
 # slippage_percent = 10
 evm_chains = []
+
+[observability]
+# Prometheus-compatible metrics endpoint. Keep this bound to loopback unless
+# the deployment provides its own authentication and network controls.
+metrics_bind = "127.0.0.1:9090"

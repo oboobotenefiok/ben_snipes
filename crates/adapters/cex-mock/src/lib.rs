@@ -10,7 +10,7 @@
 //! Nothing outside this crate needs to change.
 
 use async_trait::async_trait;
-use ben_snipes_domain::{Listing, ListingMetrics, Order, OrderStatus, Symbol, Venue, VenueKind};
+use ben_snipes_domain::{FilledBuy, FilledSell, Listing, ListingMetrics, Order, Symbol, Venue, VenueKind};
 use ben_snipes_ports::{ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -100,13 +100,15 @@ impl ExchangeClient for MockCexClient {
         Ok(*self.price.lock().await)
     }
 
-    async fn submit_order(&self, mut order: Order) -> Result<Order, PortError> {
-        // A real adapter would sign and send this to the exchange and
-        // reflect back whatever fill status it actually gets. The mock
-        // just says "filled" immediately, which is fine for exercising
-        // the rest of the pipeline but obviously not for real trading.
-        order.status = OrderStatus::Filled;
-        Ok(order)
+    async fn submit_order(&self, order: Order) -> Result<FilledSell, PortError> {
+        let price = *self.price.lock().await;
+        Ok(FilledSell {
+            quantity: order.quantity,
+            execution_price: Some(price),
+            quote_proceeds: Some(price * order.quantity),
+            fee_quote: None,
+            tx_id: Some("mock-cex-tx".to_string()),
+        })
     }
 }
 

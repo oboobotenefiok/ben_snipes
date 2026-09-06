@@ -56,9 +56,8 @@ crates/adapters/
   evm-onchain/         REAL EVM ListingSource: subscribes directly to a
                       DEX factory's pair-creation logs over eth_subscribe.
                       Chain/factory/event-agnostic, configured per chain.
-  dex-mock/            synthetic demo venue (buy+exit works end to end
-                      with fake data) - kept so `cargo run` demonstrates
-                      the full pipeline without needing real funds.
+  dex-mock/            synthetic venue used by paper mode to exercise the
+                      complete pipeline without signing or submitting trades.
 bin/runner/           composition root - the only crate that wires
                       concrete adapters into the application. Builds
                       to the `ben_snipes` binary.
@@ -139,8 +138,8 @@ the bot that spent it.
 `crates/adapters/statefile`) persists the complete open-position list -
 saved immediately after every buy, and again after every exit-check
 pass - and `main.rs` loads it at startup instead of always starting
-from an empty list. Same atomic temp-file+rename pattern, same
-single-process-only caveat as the ledger.
+from an empty list. Same atomic temp-file+rename pattern. The runner's instance lock prevents
+multiple local processes from concurrently mutating the same state directory.
 
 ### New-listing detection strategy
 
@@ -182,15 +181,12 @@ stop-loss: a position that drops after entry is simply held, however
 long it takes to recover to target, rather than sold at a loss. This is
 a deliberate strategy choice ("10% or nothing"), not an oversight.
 
-**`dex-mock`** has a real, working `SafetyGate` with hand-set
-demo data, purely to prove the full pipeline. **`pumpfun` and
-`evm-onchain` have no `SafetyGate` configured** - their
-`MetricsProvider` always returns `None` (no real volume/market-cap
-source exists yet for either), which makes `AcquisitionEngine` correctly
-refuse to buy anything through them. That's the current, deliberate,
-safe state - not a bug. Their `ExchangeClient` is likewise a
-loud-on-call placeholder that should be structurally unreachable, since
-the metrics check always bails out first.
+**Paper mode** uses the same real market-data and safety providers while
+replacing execution with a `PaperExchange`. No wallet key is required, and
+no transaction is signed or submitted. **Live mode** uses the configured
+Solana/EVM execution adapters and can spend real funds. **Detection-only**
+mode watches sources and evaluates listings but never opens or closes a
+position.
 
 ## Automation & execution platforms
 
@@ -336,9 +332,9 @@ and build artifacts via `Swatinem/rust-cache` for faster runs.
 
 ## Building and running
 
-No network or Rust toolchain was available in the environment this was
-built in, so **none of this has been compiled or tested** - written to
-be correct, but unverified. Run before trusting it:
+The local environment used for implementation does not have a Rust toolchain,
+so compile/test verification is delegated to the repository's GitHub Actions
+workflow. Run the same checks locally before trusting a deployment:
 
 ```bash
 cargo build --workspace
@@ -346,9 +342,11 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-`cargo run --bin ben_snipes` starts the poll loop against the demo
-venue (buys/exits with synthetic data), the real PumpPortal Solana
-source (real detection, real volume/safety filtering, and real buy/sell
+`cargo run --bin ben_snipes` starts the poll loop using the configured
+`execution_mode`. `paper` runs the synthetic demo plus real read-only market
+data and safety checks without signing or submitting trades. `live` uses the
+real execution adapters. `detection_only` observes listings without trading.
+The real PumpPortal Solana source (real detection, real volume/safety filtering, and real buy/sell
 execution if `SOLANA_PRIVATE_KEY` is set - **this can spend real
 funds**, see "Automation & execution platforms" before setting it), and
 any EVM chains listed in `config/default.toml`'s `evm_chains` (empty by
@@ -373,9 +371,9 @@ most wallet exports use. Leave it unset to run detection-only. **Read
 the warnings in "Automation & execution platforms" before setting this
 to a real, funded wallet's key.**
 
-## Not yet implemented
+## Remaining work
 
-- **Real sell-tax detection.** `RugCheckSafetyChecker` does not expose a
+- **Real Solana sell-tax detection.** `RugCheckSafetyChecker` does not expose a
   verified sell-tax value, so it reports `sell_tax_bps = None`. The safety
   gate treats that as unknown and rejects the listing. A real sell
   simulation is still required before Solana purchases can pass this gate.
@@ -383,6 +381,15 @@ to a real, funded wallet's key.**
   path deliberately uses a configured V2-compatible router and native-coin
   paths. An aggregator integration can be added later without changing the
   application ports.
+- **Exact fill accounting.** The persistent journal currently records the
+  price observed when take-profit triggers. The exchange port should be
+  extended later with actual filled quantity, proceeds, fees, and transaction
+  identifiers so realized P&L can be settlement-exact.
+- **Metrics/telemetry depth.** A local Prometheus-compatible `/metrics`
+  endpoint now exports runtime counters and the open-position gauge. Richer
+  OpenTelemetry traces and venue-labelled metrics can be added later.
+- **Historical backtesting.** Paper mode is live-data simulation, not a
+  historical replay engine.
 - **Wallet secrets management.** `SOLANA_PRIVATE_KEY` is read directly
   from the environment - fine for a single trusted deployment, not for
   production secrets hygiene. A real deployment wants this from a
@@ -410,3 +417,15 @@ to a real, funded wallet's key.**
 ## License
 
 MIT - see `LICENSE`.
+
+## Historical replay / backtesting
+
+The workspace now includes a deterministic replay engine and `ben_snipes-backtest` binary. It consumes a JSON dataset containing timestamped listing observations, reference prices, 24h volume, market cap, and safety reports, then applies the same acquisition criteria, safety criteria, position sizing, maximum-position cap, and take-profit rule used by the application.
+
+Example:
+
+```text
+cargo run -p ben_snipes-backtest -- data/backtest-example.json
+```
+
+This is a **strategy-rule replay**, not a market simulator. It does not claim to reproduce order-book depth, MEV, gas, latency, spread, slippage, partial fills, or venue-specific execution. The report therefore treats the replay price as the reference fill price. Live persistent P&L remains explicitly separate from this historical result.

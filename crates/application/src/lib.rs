@@ -7,9 +7,15 @@
 //! wired to a real exchange or a mock one in a test.
 
 mod acquisition_engine;
+mod backtest;
 mod new_listing_detector;
 mod position_manager;
+mod paper_exchange;
+mod runtime_metrics;
 
 pub use acquisition_engine::{AcquisitionDecision, AcquisitionEngine, SafetyGate};
+pub use backtest::{BacktestConfig, BacktestEngine, BacktestEvent, BacktestReport, BacktestTrade};
 pub use new_listing_detector::NewListingDetector;
-pub use position_manager::PositionManager;
+pub use position_manager::{ExitResult, PositionManager};
+pub use paper_exchange::PaperExchange;
+pub use runtime_metrics::RuntimeMetrics;

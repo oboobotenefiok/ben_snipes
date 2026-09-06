@@ -15,6 +15,7 @@ mod listing;
 mod order;
 mod position;
 mod safety;
+mod trade;
 mod venue;
 
 pub use acquisition::{AcquisitionCriteria, ListingMetrics};
@@ -22,7 +23,8 @@ pub use canonical::CanonicalTokenId;
 pub use chain::Chain;
 pub use error::DomainError;
 pub use listing::{Listing, Symbol};
-pub use order::{FilledBuy, Order, OrderSide, OrderStatus};
+pub use order::{FilledBuy, FilledSell, Order, OrderSide, OrderStatus};
 pub use position::{Position, ProfitTarget};
 pub use safety::{SafetyCriteria, SafetyReport};
+pub use trade::{PerformanceSummary, TradeRecord};
 pub use venue::{Venue, VenueKind};

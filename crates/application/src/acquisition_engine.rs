@@ -177,7 +177,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use ben_snipes_domain::{
-        Chain, FilledBuy, ListingMetrics, Order, OrderStatus, SafetyReport, Symbol, Venue, VenueKind,
+        Chain, FilledBuy, ListingMetrics, Order, SafetyReport, Symbol, Venue, VenueKind,
     };
     use std::collections::HashSet;
     use time::OffsetDateTime;
@@ -233,9 +233,14 @@ mod tests {
             })
         }
 
-        async fn submit_order(&self, mut order: Order) -> Result<Order, PortError> {
-            order.status = OrderStatus::Filled;
-            Ok(order)
+        async fn submit_order(&self, order: Order) -> Result<FilledSell, PortError> {
+            Ok(FilledSell {
+                quantity: order.quantity,
+                execution_price: Some(Decimal::ONE),
+                quote_proceeds: Some(order.quantity),
+                fee_quote: None,
+                tx_id: Some("test-tx".to_string()),
+            })
         }
     }
 
