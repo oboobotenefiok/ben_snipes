@@ -27,7 +27,7 @@ use ben_snipes_ports::{
 };
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 use std::str::FromStr;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, Mutex};
@@ -328,6 +328,9 @@ impl TokenSafetyChecker for HoneypotEvmSafetyChecker {
         // report. The actual sell tax remains independently measured.
         Ok(Some(SafetyReport {
             sell_tax_bps: Some(sell_tax_bps),
+            token_transfer_fee_bps: Some(0),
+            sellability: ben_snipes_domain::SellabilityEvidence::Simulated,
+            has_permanent_delegate: false,
             ownership_renounced: true,
             liquidity_locked: true,
             is_mintable: false,
@@ -344,6 +347,7 @@ pub struct EvmUniswapV2Exchange {
     wrapped_native: Address,
     slippage_percent: u32,
     signer: Option<PrivateKeySigner>,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl EvmUniswapV2Exchange {
@@ -363,7 +367,16 @@ impl EvmUniswapV2Exchange {
         let router = router.parse::<Address>().map_err(|e| format!("invalid router address: {e}"))?;
         let wrapped_native = wrapped_native.parse::<Address>().map_err(|e| format!("invalid wrapped native address: {e}"))?;
         if slippage_percent >= 100 { return Err("EVM slippage_percent must be below 100".to_string()); }
-        Ok(Self { chain_id, execution_rpc_url, private_rpc_url, router, wrapped_native, slippage_percent, signer: Some(signer) })
+        Ok(Self {
+            chain_id,
+            execution_rpc_url,
+            private_rpc_url,
+            router,
+            wrapped_native,
+            slippage_percent,
+            signer: Some(signer),
+            write_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     pub fn read_only(
@@ -386,6 +399,7 @@ impl EvmUniswapV2Exchange {
             wrapped_native,
             slippage_percent,
             signer: None,
+            write_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -416,6 +430,7 @@ impl EvmUniswapV2Exchange {
         value: U256,
         input: Bytes,
     ) -> Result<alloy::rpc::types::TransactionReceipt, PortError> {
+        let _write_guard = self.write_lock.lock().await;
         let private_url = self.private_rpc_url.as_deref().ok_or_else(|| {
             PortError::Rejected("private_rpc_url is required for EVM execution".to_string())
         })?;
@@ -568,6 +583,9 @@ impl ExchangeClient for EvmUniswapV2Exchange {
             if !approval_receipt.status() { return Err(PortError::Rejected("token approval transaction reverted".to_string())); }
             fee_quote += Self::native_from_wei(U256::from(approval_receipt.cost()))?;
         }
+        let native_before_sell = provider.get_balance(wallet).await.map_err(|e| PortError::Network {
+            venue: "evm-rpc".to_string(), source: Box::new(e),
+        })?;
         let quote = router.getAmountsOut(amount, vec![token, self.wrapped_native]).call().await
             .map_err(|e| PortError::Rejected(format!("EVM sell quote failed: {e}")))?;
         let expected = quote.last().copied().ok_or_else(|| PortError::Rejected("router returned an empty sell quote".to_string()))?;
@@ -576,11 +594,22 @@ impl ExchangeClient for EvmUniswapV2Exchange {
         let call = router.swapExactTokensForETHSupportingFeeOnTransferTokens(amount, min_out, vec![token, self.wrapped_native], wallet, deadline);
         let receipt = self.send_private_transaction(&provider, self.router, U256::ZERO, call.calldata().to_owned()).await?;
         if !receipt.status() { return Err(PortError::Rejected("EVM sell transaction reverted".to_string())); }
-        fee_quote += Self::native_from_wei(U256::from(receipt.cost()))?;
+        let native_after_sell = provider.get_balance(wallet).await.map_err(|e| PortError::Network {
+            venue: "evm-rpc".to_string(), source: Box::new(e),
+        })?;
+        let sell_gas = U256::from(receipt.cost());
+        let native_delta = native_after_sell.saturating_sub(native_before_sell);
+        let gross_proceeds_wei = native_delta.saturating_add(sell_gas);
+        if gross_proceeds_wei.is_zero() {
+            return Err(PortError::Rejected("EVM sell confirmed but produced no native proceeds".to_string()));
+        }
+        let quote_proceeds = Self::native_from_wei(gross_proceeds_wei)?;
+        fee_quote += Self::native_from_wei(sell_gas)?;
+        let execution_price = quote_proceeds / order.quantity;
         Ok(FilledSell {
             quantity: order.quantity,
-            execution_price: None,
-            quote_proceeds: None,
+            execution_price: Some(execution_price),
+            quote_proceeds: Some(quote_proceeds),
             fee_quote: Some(fee_quote),
             tx_id: Some(format!("{}", receipt.transaction_hash)),
         })

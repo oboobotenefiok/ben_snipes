@@ -24,7 +24,7 @@
 //! call in this environment (no network access here). Sanity-check
 //! against a real RPC response shape on first run.
 
-use crate::execution::{execute_trade, TradeAction, TradeRequest};
+use crate::execution::{execute_trade, preflight_trade, TradeAction, TradeRequest};
 use crate::price_feed;
 use crate::retry::with_retry;
 use async_trait::async_trait;
@@ -412,6 +412,31 @@ impl ExchangeClient for PumpPortalExchangeClient {
             quantity,
             entry_price: quote_amount / quantity,
         })
+    }
+
+    async fn preflight_sell(&self, order: &Order) -> Result<(), PortError> {
+        if order.side != OrderSide::Sell {
+            return Err(PortError::Rejected(
+                "PumpPortal sell preflight requires a sell order".to_string(),
+            ));
+        }
+        if order.quantity <= Decimal::ZERO {
+            return Err(PortError::Rejected(
+                "PumpPortal sell preflight requires a positive quantity".to_string(),
+            ));
+        }
+
+        let request = TradeRequest {
+            action: TradeAction::Sell,
+            mint: order.symbol.as_str().to_string(),
+            amount: order.quantity.to_string(),
+            slippage_percent: self.slippage_percent,
+            priority_fee_sol: self.priority_fee_sol,
+        };
+
+        preflight_trade(&self.http, self.wallet()?, &self.rpc_url, &request)
+            .await
+            .map_err(PortError::Rejected)
     }
 
     async fn submit_order(&self, order: Order) -> Result<FilledSell, PortError> {

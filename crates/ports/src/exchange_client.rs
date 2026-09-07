@@ -36,4 +36,13 @@ pub trait ExchangeClient: Send + Sync {
     /// partially unavailable. Implementations must never fabricate missing
     /// settlement fields.
     async fn submit_order(&self, order: Order) -> Result<FilledSell, PortError>;
+
+    /// Optional venue-specific preflight for a sell. DEX adapters can use
+    /// this to simulate the exact sell transaction against current on-chain
+    /// state before signing it. The default is a no-op so venues whose
+    /// submit path already performs an equivalent simulation do not need a
+    /// second implementation.
+    async fn preflight_sell(&self, _order: &Order) -> Result<(), PortError> {
+        Ok(())
+    }
 }

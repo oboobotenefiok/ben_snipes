@@ -72,6 +72,12 @@ pub struct SafetyConfig {
     /// DEX listing to pass the honeypot/rug safety gate. Only applies to
     /// venues that have a `SafetyGate` configured - see the README.
     pub max_sell_tax_bps: u32,
+    #[serde(default = "default_max_token_transfer_fee_bps")]
+    pub max_token_transfer_fee_bps: u32,
+}
+
+fn default_max_token_transfer_fee_bps() -> u32 {
+    0
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

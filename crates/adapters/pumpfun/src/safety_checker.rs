@@ -64,14 +64,129 @@ struct TokenInfo {
     freeze_authority: Option<Value>,
 }
 
+const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+#[derive(Debug, Clone, Copy)]
+struct MintPolicy {
+    transfer_fee_bps: Option<u32>,
+    permanent_delegate: bool,
+    transfer_hook: bool,
+}
+
+fn max_transfer_fee_bps(value: &Value) -> Option<u32> {
+    fn walk(value: &Value, max_bps: &mut Option<u32>) {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    if key == "transferFeeBasisPoints" {
+                        if let Some(raw) = child.as_u64().and_then(|value| u32::try_from(value).ok()) {
+                            *max_bps = Some(max_bps.map_or(raw, |current| current.max(raw)));
+                        }
+                    }
+                    walk(child, max_bps);
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    walk(child, max_bps);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut max_bps = None;
+    walk(value, &mut max_bps);
+    max_bps
+}
+
+fn extension_named(value: &Value, extension_name: &str) -> bool {
+    match value {
+        Value::Object(object) => {
+            if object.get("extension").and_then(Value::as_str) == Some(extension_name) {
+                return true;
+            }
+            object.values().any(|child| extension_named(child, extension_name))
+        }
+        Value::Array(array) => array.iter().any(|child| extension_named(child, extension_name)),
+        _ => false,
+    }
+}
+
+impl RugCheckSafetyChecker {
+    async fn inspect_mint_policy(&self, mint: &str) -> Result<Option<MintPolicy>, PortError> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [mint, { "encoding": "jsonParsed", "commitment": "confirmed" }],
+        });
+
+        let response = self
+            .http
+            .post(&self.rpc_url)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| PortError::Network {
+                venue: "solana-rpc".to_string(),
+                source: Box::new(e),
+            })?;
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        let json: Value = response.json().await.map_err(|e| PortError::MalformedResponse {
+            venue: "solana-rpc".to_string(),
+            reason: e.to_string(),
+        })?;
+
+        let Some(account) = json.pointer("/result/value") else {
+            return Ok(None);
+        };
+        if account.is_null() {
+            return Ok(None);
+        }
+
+        let owner = account.get("owner").and_then(Value::as_str);
+        match owner {
+            Some(SPL_TOKEN_PROGRAM_ID) => Ok(Some(MintPolicy {
+                transfer_fee_bps: Some(0),
+                permanent_delegate: false,
+                transfer_hook: false,
+            })),
+            Some(TOKEN_2022_PROGRAM_ID) => {
+                let extensions = account.pointer("/data/parsed/info/extensions").cloned().unwrap_or(Value::Null);
+                let has_transfer_fee_config = extension_named(&extensions, "transferFeeConfig");
+                let transfer_fee_bps = if has_transfer_fee_config {
+                    max_transfer_fee_bps(&extensions)
+                } else {
+                    Some(0)
+                };
+                Ok(Some(MintPolicy {
+                    transfer_fee_bps,
+                    permanent_delegate: extension_named(&extensions, "permanentDelegate"),
+                    transfer_hook: extension_named(&extensions, "transferHook"),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 pub struct RugCheckSafetyChecker {
     http: reqwest::Client,
+    rpc_url: String,
 }
 
 impl RugCheckSafetyChecker {
     pub fn new() -> Self {
         Self {
             http: reqwest::Client::new(),
+            rpc_url: std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
         }
     }
 }
@@ -113,6 +228,9 @@ impl TokenSafetyChecker for RugCheckSafetyChecker {
         if report.rugged {
             return Ok(Some(SafetyReport {
                 sell_tax_bps: None,
+                token_transfer_fee_bps: None,
+                sellability: ben_snipes_domain::SellabilityEvidence::Unknown,
+                has_permanent_delegate: false,
                 ownership_renounced: false,
                 liquidity_locked: false,
                 is_mintable: true,
@@ -146,11 +264,24 @@ impl TokenSafetyChecker for RugCheckSafetyChecker {
             _ => false,
         };
 
+        let Some(mint_policy) = self.inspect_mint_policy(symbol.as_str()).await? else {
+            return Ok(None);
+        };
+
         Ok(Some(SafetyReport {
-            // Unknown is represented explicitly. The domain safety gate
-            // rejects `None`, so a missing sell simulation cannot pass as a
-            // confirmed zero-tax token.
+            // RugCheck does not establish a real sell path or a DEX sell tax.
+            // Keep those independent and fail closed rather than treating a
+            // token-level transfer fee as proof that a sell will work.
             sell_tax_bps: None,
+            token_transfer_fee_bps: mint_policy.transfer_fee_bps,
+            sellability: if mint_policy.permanent_delegate || mint_policy.transfer_hook {
+                ben_snipes_domain::SellabilityEvidence::Failed
+            } else if !freeze_authority_present {
+                ben_snipes_domain::SellabilityEvidence::Structural
+            } else {
+                ben_snipes_domain::SellabilityEvidence::Failed
+            },
+            has_permanent_delegate: mint_policy.permanent_delegate,
             ownership_renounced,
             liquidity_locked,
             is_mintable,

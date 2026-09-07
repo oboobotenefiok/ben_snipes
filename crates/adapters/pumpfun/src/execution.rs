@@ -129,6 +129,32 @@ pub async fn execute_trade(
     rpc_url: &str,
     request: &TradeRequest,
 ) -> Result<String, String> {
+    let raw_tx_bytes = build_unsigned_transaction(http, wallet, request).await?;
+    simulate_transaction(http, rpc_url, &raw_tx_bytes).await?;
+
+    let signed_bytes = sign_transaction(wallet, &raw_tx_bytes)?;
+    broadcast(http, rpc_url, &signed_bytes).await
+}
+
+/// Builds and simulates a PumpPortal transaction without signing or
+/// broadcasting it. This is used immediately before exits, when the wallet
+/// already owns the token, so the simulation can validate the actual current
+/// account state rather than merely checking that a route exists.
+pub async fn preflight_trade(
+    http: &reqwest::Client,
+    wallet: &Keypair,
+    rpc_url: &str,
+    request: &TradeRequest,
+) -> Result<(), String> {
+    let raw_tx_bytes = build_unsigned_transaction(http, wallet, request).await?;
+    simulate_transaction(http, rpc_url, &raw_tx_bytes).await
+}
+
+async fn build_unsigned_transaction(
+    http: &reqwest::Client,
+    wallet: &Keypair,
+    request: &TradeRequest,
+) -> Result<Vec<u8>, String> {
     let body = serde_json::json!({
         "publicKey": wallet.pubkey().to_string(),
         "action": request.action.as_str(),
@@ -146,7 +172,7 @@ pub async fn execute_trade(
         "pool": "auto",
     });
 
-    let raw_tx_bytes = with_retry(3, || async {
+    with_retry(3, || async {
         let response = http
             .post(TRADE_LOCAL_URL)
             .header("Content-Type", "application/json")
@@ -166,12 +192,7 @@ pub async fn execute_trade(
             .await
             .map_err(|e| format!("failed to read trade-local response body: {e}"))
     })
-    .await?;
-
-    simulate_transaction(http, rpc_url, &raw_tx_bytes).await?;
-
-    let signed_bytes = sign_transaction(wallet, &raw_tx_bytes)?;
-    broadcast(http, rpc_url, &signed_bytes).await
+    .await
 }
 
 /// Simulates the unsigned transaction before spending signing material or

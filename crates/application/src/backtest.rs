@@ -25,6 +25,7 @@ pub struct BacktestEvent {
 pub struct BacktestConfig {
     pub min_volume_24h: Decimal,
     pub max_sell_tax_bps: u32,
+    pub max_token_transfer_fee_bps: u32,
     pub take_profit_percent: Decimal,
     pub position_size: Decimal,
     pub max_open_positions: usize,
@@ -83,7 +84,10 @@ impl BacktestEngine {
             .map_err(|e| e.to_string())?;
         let target = ProfitTarget::from_percent(config.take_profit_percent)
             .map_err(|e| e.to_string())?;
-        let safety_criteria = SafetyCriteria::new(config.max_sell_tax_bps);
+        let safety_criteria = SafetyCriteria::new(
+            config.max_sell_tax_bps,
+            config.max_token_transfer_fee_bps,
+        );
         Ok(Self {
             config,
             criteria,
@@ -206,6 +210,9 @@ mod tests {
             }),
             safety: Some(SafetyReport {
                 sell_tax_bps: Some(100),
+                token_transfer_fee_bps: Some(0),
+                sellability: ben_snipes_domain::SellabilityEvidence::Simulated,
+                has_permanent_delegate: false,
                 ownership_renounced: true,
                 liquidity_locked: false,
                 is_mintable: false,
@@ -217,6 +224,7 @@ mod tests {
         BacktestEngine::new(BacktestConfig {
             min_volume_24h: Decimal::from(50_000),
             max_sell_tax_bps: 1_000,
+            max_token_transfer_fee_bps: 0,
             take_profit_percent: Decimal::TEN,
             position_size: Decimal::from(100),
             max_open_positions: 2,
@@ -253,6 +261,9 @@ mod tests {
         let mut first = event(1, "AAA", 10, 100_000);
         first.safety = Some(SafetyReport {
             sell_tax_bps: None,
+            token_transfer_fee_bps: Some(0),
+            sellability: ben_snipes_domain::SellabilityEvidence::Simulated,
+            has_permanent_delegate: false,
             ..first.safety.expect("test event has safety")
         });
         let report = engine().run(vec![first]);

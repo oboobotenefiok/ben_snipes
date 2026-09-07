@@ -259,9 +259,10 @@ at three different confidence levels, and it matters which is which:**
   `mintAuthority`/`freezeAuthority` field names are independently
   corroborated by two sources. Liquidity-lock detection is best-effort.
   **Sell-tax detection is not meaningfully implemented** - RugCheck
-  doesn't appear to expose it, so `sell_tax_bps` is represented as
-  `None`, which means *unverified* and is now rejected by the safety
-  gate rather than being treated as confirmed zero tax. There's also a
+  does not provide a verified DEX sell-tax value, so `sell_tax_bps` remains
+  `None`. The safety model now keeps DEX sell tax separate from Token-2022
+  transfer fees and from sellability evidence, so a token transfer fee can
+  never be mistaken for proof that a DEX sell will succeed. There's also a
   residual risk
   worth naming directly: if the two authority field names turn out to be
   wrong, they'd silently read as "renounced" (safe) rather than erroring
@@ -305,10 +306,10 @@ became capable of spending real funds:** (1) the signing code in
 `execution.rs` is pinned to the current `solana-sdk` 4.1.0 shape and now
 validates the returned transaction before signing; (2) RugCheck's
 ability to verify sell-tax is still absent, and the safety gate now
-fails closed on an unknown sell-tax value; (3) an explicit
-`simulateTransaction` preflight now runs before signing, while the
-transaction is still unsigned; (4) this environment still has no Rust
-toolchain because Debian package index access is unavailable. Start
+fails closed on an unknown sell-tax value; (3) `simulateTransaction`
+preflight now runs before signing on both entry transactions and the exact
+sell transaction immediately before an exit; (4) this environment still
+has no Rust toolchain because Debian package index access is unavailable. Start
 with the smallest `max_position_size` you're willing to lose entirely,
 watch the logs (`RUST_LOG=debug`), and watch the wallet address on a
 block explorer during the first several trades.
@@ -317,7 +318,9 @@ block explorer during the first several trades.
 Uniswap-V2-compatible native-coin buys and token sells. Every write is
 simulated before signing, and the signed EIP-2718 transaction is submitted
 through the configured private RPC. The adapter verifies the connected chain
-ID before execution. EVM safety uses Honeypot.is buy/sell simulation and
+ID before execution, serializes wallet writes to prevent in-process nonce
+collisions, and derives EVM sell proceeds from the wallet balance delta plus
+the confirmed transaction gas cost. EVM safety uses Honeypot.is buy/sell simulation and
 requires a successful simulation, no honeypot verdict, low scanner risk,
 verified root source, and a measured sell tax below the configured limit.
 
@@ -373,23 +376,28 @@ to a real, funded wallet's key.**
 
 ## Remaining work
 
-- **Real Solana sell-tax detection.** `RugCheckSafetyChecker` does not expose a
-  verified sell-tax value, so it reports `sell_tax_bps = None`. The safety
-  gate treats that as unknown and rejects the listing. A real sell
-  simulation is still required before Solana purchases can pass this gate.
+- **Real Solana entry-side sell-tax detection.** `RugCheckSafetyChecker` does
+  not expose a verified DEX sell-tax value, so it reports `sell_tax_bps = None`
+  and the safety gate rejects the listing. The checker now separately inspects
+  the mint program and Token-2022 transfer-fee/permanent-delegate state.
+  Sellability evidence is represented explicitly as simulated vs structural,
+  rather than collapsing those signals into one tax number. Solana still does
+  not get a pre-entry simulated DEX sell, so this remains fail-closed.
 - **EVM routing beyond Uniswap-V2-compatible routers.** The current live EVM
   path deliberately uses a configured V2-compatible router and native-coin
   paths. An aggregator integration can be added later without changing the
   application ports.
-- **Exact fill accounting.** The persistent journal currently records the
-  price observed when take-profit triggers. The exchange port should be
-  extended later with actual filled quantity, proceeds, fees, and transaction
-  identifiers so realized P&L can be settlement-exact.
+- **Execution-quality modelling.** The persistent journal now records actual
+  settlement quantity, proceeds, fees, and transaction identifiers whenever
+  the venue exposes them, including confirmed EVM native proceeds and gas
+  costs. Remaining work is deeper execution-quality data,
+  such as route-level price impact and venue-specific fee attribution.
 - **Metrics/telemetry depth.** A local Prometheus-compatible `/metrics`
   endpoint now exports runtime counters and the open-position gauge. Richer
   OpenTelemetry traces and venue-labelled metrics can be added later.
-- **Historical backtesting.** Paper mode is live-data simulation, not a
-  historical replay engine.
+- **Historical backtesting realism.** Historical replay is implemented, but
+  it remains a strategy replay rather than a microstructure simulator. Spread,
+  latency, liquidity depth, MEV, and partial-fill modelling can be added later.
 - **Wallet secrets management.** `SOLANA_PRIVATE_KEY` is read directly
   from the environment - fine for a single trusted deployment, not for
   production secrets hygiene. A real deployment wants this from a

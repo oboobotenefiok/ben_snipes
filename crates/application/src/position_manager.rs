@@ -52,6 +52,12 @@ impl PositionManager {
             position.quantity,
         )?;
 
+        // Give DEX adapters a chance to simulate the exact exit while the
+        // wallet still owns the tokens. A failed simulation leaves the
+        // position open instead of broadcasting a transaction that the
+        // current chain state already proves is doomed.
+        self.exchange.preflight_sell(&order).await?;
+
         let fill = self.exchange.submit_order(order).await?;
         if fill.quantity <= rust_decimal::Decimal::ZERO {
             return Err(PortError::Rejected(

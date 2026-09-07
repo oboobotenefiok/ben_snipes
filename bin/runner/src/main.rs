@@ -176,6 +176,9 @@ async fn build_venues(
                 "NEWCOIN-SOL",
                 SafetyReport {
                     sell_tax_bps: Some(150),
+                    token_transfer_fee_bps: Some(0),
+                    sellability: ben_snipes_domain::SellabilityEvidence::Simulated,
+                    has_permanent_delegate: false,
                     ownership_renounced: true,
                     liquidity_locked: true,
                     is_mintable: false,
@@ -351,7 +354,10 @@ async fn main() {
             AcquisitionCriteria::new(config.risk.min_volume_24h),
             "risk.min_volume_24h",
         ),
-        safety_criteria: SafetyCriteria::new(config.safety.max_sell_tax_bps),
+        safety_criteria: SafetyCriteria::new(
+            config.safety.max_sell_tax_bps,
+            config.safety.max_token_transfer_fee_bps,
+        ),
     };
 
     info!(
@@ -363,6 +369,7 @@ async fn main() {
         max_new_listings_per_cycle = config.risk.max_new_listings_per_cycle,
         entry_kill_switch_file = %config.risk.entry_kill_switch_file,
         max_sell_tax_bps = config.safety.max_sell_tax_bps,
+        max_token_transfer_fee_bps = config.safety.max_token_transfer_fee_bps,
         evm_chains = config.evm_chains.len(),
         execution_mode = ?config.execution_mode,
         poll_interval_seconds = config.risk.poll_interval_seconds,

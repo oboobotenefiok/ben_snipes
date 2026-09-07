@@ -39,6 +39,9 @@ entry_kill_switch_file = "state/STOP_ENTRIES"
 # a honeypot signal rather than an aggressive-but-legitimate tokenomics
 # choice - tune down if that's too permissive for your risk tolerance.
 max_sell_tax_bps = 1000
+# Token-2022 transfer fees are separate from DEX/router sell taxes.
+# Keep this at zero unless a non-zero token transfer fee is explicitly acceptable.
+max_token_transfer_fee_bps = 0
 
 [storage]
 state_dir = "state"

@@ -110,6 +110,9 @@ impl AcquisitionEngine {
                 info!(
                     symbol = listing.symbol.as_str(),
                     sell_tax_bps = ?report.sell_tax_bps,
+                    token_transfer_fee_bps = ?report.token_transfer_fee_bps,
+                    sellability = ?report.sellability,
+                    has_permanent_delegate = report.has_permanent_delegate,
                     ownership_renounced = report.ownership_renounced,
                     liquidity_locked = report.liquidity_locked,
                     is_mintable = report.is_mintable,
@@ -352,13 +355,16 @@ mod tests {
         });
         let dangerous_report = SafetyReport {
             sell_tax_bps: Some(9_000),
+            token_transfer_fee_bps: Some(0),
+            sellability: ben_snipes_domain::SellabilityEvidence::Simulated,
+            has_permanent_delegate: false,
             ownership_renounced: false,
             liquidity_locked: false,
             is_mintable: true,
         };
         let gate = SafetyGate::new(
             Arc::new(StubSafetyChecker { report: Some(dangerous_report) }),
-            SafetyCriteria::new(1_000),
+            SafetyCriteria::new(1_000, 0),
         );
         let engine = build_engine(Some(passing_metrics()), Some(gate), exchange.clone(), Arc::new(InMemoryLedger::empty()));
 
