@@ -12,7 +12,7 @@
 
 use async_trait::async_trait;
 use ben_snipes_domain::{
-    Chain, FilledBuy, Listing, ListingMetrics, Order, SafetyReport, Symbol, Venue,
+    Chain, FilledBuy, FilledSell, Listing, ListingMetrics, Order, SafetyReport, Symbol, Venue,
     VenueKind,
 };
 use ben_snipes_ports::{
