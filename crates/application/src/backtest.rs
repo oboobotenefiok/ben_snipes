@@ -14,6 +14,7 @@ use time::OffsetDateTime;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BacktestEvent {
+    #[serde(with = "time::serde::rfc3339")]
     pub timestamp: OffsetDateTime,
     pub listing: Listing,
     pub price: Decimal,
@@ -35,7 +36,9 @@ pub struct BacktestConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BacktestTrade {
     pub trade: TradeRecord,
+    #[serde(with = "time::serde::rfc3339")]
     pub opened_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub closed_at: OffsetDateTime,
 }
 
@@ -116,9 +119,13 @@ impl BacktestEngine {
             // Exit checks happen before a same-timestamp new entry. This keeps
             // the maximum-position rule conservative and makes the replay
             // deterministic when a price jump closes an existing position.
+            // Scoped to positions matching this event's own symbol - each
+            // event only carries a price for one listing, so applying it to
+            // every open position would spuriously exit unrelated tokens on
+            // an interleaved multi-symbol replay.
             let mut remaining = Vec::with_capacity(open_positions.len());
             for (position, opened_at) in open_positions.drain(..) {
-                if position.should_exit(event.price) {
+                if position.symbol == event.listing.symbol && position.should_exit(event.price) {
                     let trade = TradeRecord::from_position(&position, event.price, event.timestamp);
                     report.trades.push(BacktestTrade {
                         trade,
@@ -281,5 +288,24 @@ mod tests {
         assert_eq!(report.entries_opened, 1);
         assert!(report.trades.is_empty());
         assert_eq!(report.still_open.len(), 1);
+    }
+
+    #[test]
+    fn a_symbols_price_never_exits_a_different_open_position() {
+        // Two symbols open concurrently. BBB's price never moves, so it
+        // must stay open even while AAA's price crosses AAA's own
+        // take-profit target - a shared, unscoped price check would
+        // incorrectly close BBB using AAA's price instead.
+        let report = engine().run(vec![
+            event(1, "AAA", 10, 100_000),
+            event(2, "BBB", 10, 100_000),
+            event(3, "AAA", 20, 100_000),
+        ]);
+
+        assert_eq!(report.entries_opened, 2);
+        assert_eq!(report.trades.len(), 1, "only AAA's own take-profit should have triggered an exit");
+        assert_eq!(report.trades[0].trade.symbol.as_str(), "AAA");
+        assert_eq!(report.still_open.len(), 1);
+        assert_eq!(report.still_open[0].symbol.as_str(), "BBB");
     }
 }

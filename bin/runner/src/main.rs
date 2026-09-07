@@ -643,8 +643,26 @@ async fn main() {
                                         tx_id = ?trade.tx_id,
                                         fee_quote = %trade.fee_quote,
                                         pnl = %trade.pnl,
-                                        "position closed but failed to persist trade journal entry; will not resell the already-closed position"
+                                        "position closed but failed to persist trade journal entry; queued for durable retry"
                                     );
+                                    // The sell already executed - the position is
+                                    // gone either way - but the journal write
+                                    // failed, so this trade would otherwise be
+                                    // lost forever. Queue it in the durable
+                                    // pending-trade store so the top of the next
+                                    // tick (or a fresh process after a crash)
+                                    // retries the journal write instead of
+                                    // silently dropping the record.
+                                    trade_history.push(trade.clone());
+                                    performance = PerformanceSummary::from_trades(&trade_history);
+                                    pending_trades.push(trade);
+                                    if let Err(persist_err) = pending_trade_store.save(&pending_trades).await {
+                                        runtime_metrics.inc_journal_errors();
+                                        warn!(
+                                            error = %persist_err,
+                                            "failed to persist pending trade journal queue after a journal write failure"
+                                        );
+                                    }
                                 }
                             }
                         }

@@ -64,6 +64,28 @@ pub struct RiskConfig {
     /// substantial volume. See `config/default.toml` for the reasoning
     /// behind the specific default chosen.
     pub min_volume_24h: Decimal,
+
+    /// Hard cap on concurrently open positions across all venues. Once
+    /// reached, remaining listings in a poll cycle are skipped rather
+    /// than queued, so capital exposure never exceeds
+    /// `max_open_positions * max_position_size`.
+    pub max_open_positions: usize,
+
+    /// Consecutive acquisition/exit failures (I/O errors, not ordinary
+    /// "pending"/"rejected" outcomes) before the entry circuit breaker
+    /// opens and new buys pause for the rest of that poll cycle.
+    pub max_consecutive_failures: u32,
+
+    /// Maximum number of newly-detected listings processed for
+    /// acquisition in a single poll cycle across all venues. Protects
+    /// against a listing burst (e.g. a source replaying its backlog)
+    /// from spending capital faster than the operator can react.
+    pub max_new_listings_per_cycle: usize,
+
+    /// Path to an operator-controlled kill-switch file. While it exists,
+    /// no new positions are opened, but existing positions are still
+    /// watched and exited normally.
+    pub entry_kill_switch_file: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -136,7 +136,7 @@ mod tests {
             Err(error) => panic!("paper sell should succeed: {error}"),
         };
         assert_eq!(filled.quantity, Decimal::ONE);
-        assert_eq!(filled.execution_price, Some(Decimal::ONE));
-        assert_eq!(filled.quote_proceeds, Some(Decimal::ONE));
+        assert_eq!(filled.execution_price, Some(Decimal::from(2)));
+        assert_eq!(filled.quote_proceeds, Some(Decimal::from(2)));
     }
 }

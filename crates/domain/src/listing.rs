@@ -44,6 +44,7 @@ pub struct Listing {
     pub symbol: Symbol,
     pub venue: Venue,
     pub chain: Chain,
+    #[serde(with = "time::serde::rfc3339")]
     pub first_seen: OffsetDateTime,
 }
 

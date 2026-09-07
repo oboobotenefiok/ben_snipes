@@ -18,6 +18,7 @@ use time::OffsetDateTime;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PendingListing {
     pub listing: Listing,
+    #[serde(with = "time::serde::rfc3339")]
     pub pending_since: OffsetDateTime,
 }
 
@@ -40,6 +41,7 @@ impl<'de> Deserialize<'de> for PendingListing {
         enum Wire {
             Current {
                 listing: Listing,
+                #[serde(with = "time::serde::rfc3339")]
                 pending_since: OffsetDateTime,
             },
             Legacy(Listing),

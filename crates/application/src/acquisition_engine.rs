@@ -180,7 +180,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use ben_snipes_domain::{
-        Chain, FilledBuy, ListingMetrics, Order, SafetyReport, Symbol, Venue, VenueKind,
+        Chain, FilledBuy, FilledSell, ListingMetrics, Order, SafetyReport, Symbol, Venue, VenueKind,
     };
     use std::collections::HashSet;
     use time::OffsetDateTime;

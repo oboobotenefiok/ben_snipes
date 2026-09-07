@@ -9,7 +9,7 @@
 //! depend on Flashbots-specific RPC methods.
 
 use alloy::{
-    network::{eip2718::Encodable2718, EthereumWallet, NetworkTransactionBuilder},
+    network::{eip2718::Encodable2718, EthereumWallet, NetworkTransactionBuilder, ReceiptResponse},
     primitives::{Address, Bytes, U256},
     providers::{Provider, ProviderBuilder},
     rpc::types::TransactionRequest,
@@ -19,7 +19,7 @@ use alloy::{
 use async_trait::async_trait;
 use ben_snipes_adapter_ws_support::connect_with_backoff;
 use ben_snipes_domain::{
-    Chain, DomainError, FilledBuy, Listing, ListingMetrics, Order, OrderSide,
+    Chain, DomainError, FilledBuy, FilledSell, Listing, ListingMetrics, Order, OrderSide,
     SafetyReport, Symbol, Venue, VenueKind,
 };
 use ben_snipes_ports::{
@@ -321,19 +321,28 @@ impl TokenSafetyChecker for HoneypotEvmSafetyChecker {
         let root_open_source = report.contract_code.and_then(|c| c.root_open_source).unwrap_or(false);
         if !root_open_source { return Ok(None); }
 
-        // The domain SafetyReport predates EVM-specific scanner semantics.
-        // For EVM we use the composite scanner verdict as the safety signal:
-        // successful buy/sell simulation, no honeypot verdict, low risk, and
-        // verified root source are required before constructing a passing
-        // report. The actual sell tax remains independently measured.
+        // honeypot.is's composite verdict only speaks to buy/sell
+        // simulation, honeypot classification, risk score, and source
+        // verification - it does not tell us whether the contract still
+        // has a mint function, whether ownership is renounced, whether
+        // liquidity is locked, or the real token-level transfer fee.
+        // Reporting those as "safe" defaults would be exactly the
+        // fail-open bug this codebase's safety model exists to prevent
+        // (see `SafetyCriteria::passes`), so they are reported as
+        // unverified/failing here rather than guessed. A real EVM
+        // deployment needs a genuine mint-authority/ownership/liquidity
+        // -lock data source (e.g. a contract-analysis or token-scanner
+        // API) wired in before autonomous EVM buys can pass this gate -
+        // simulating success and a low honeypot risk score is
+        // necessary but not sufficient.
         Ok(Some(SafetyReport {
             sell_tax_bps: Some(sell_tax_bps),
-            token_transfer_fee_bps: Some(0),
+            token_transfer_fee_bps: None,
             sellability: ben_snipes_domain::SellabilityEvidence::Simulated,
             has_permanent_delegate: false,
-            ownership_renounced: true,
-            liquidity_locked: true,
-            is_mintable: false,
+            ownership_renounced: false,
+            liquidity_locked: false,
+            is_mintable: true,
         }))
     }
 }

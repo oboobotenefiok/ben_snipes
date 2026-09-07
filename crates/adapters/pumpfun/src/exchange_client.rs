@@ -488,3 +488,18 @@ impl ExchangeClient for PumpPortalExchangeClient {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buy_balance_requirement_includes_fee_buffer_and_priority_fee() {
+        let quote_amount = Decimal::from(10_i64) / Decimal::from(LAMPORTS_PER_SOL);
+        let priority_fee_sol = Decimal::new(1, 4);
+        let required_balance =
+            quote_amount + priority_fee_sol + Decimal::from(FEE_BUFFER_LAMPORTS) / Decimal::from(LAMPORTS_PER_SOL);
+
+        assert_eq!(required_balance, Decimal::new(151, 4));
+    }
+}

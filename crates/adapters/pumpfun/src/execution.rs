@@ -294,8 +294,7 @@ fn sign_transaction(wallet: &Keypair, raw_tx_bytes: &[u8]) -> Result<Vec<u8>, St
 /// Broadcasts already-signed transaction bytes via a raw JSON-RPC
 /// `sendTransaction` call. Deliberately not using the `solana-client`
 /// crate - see this module's top doc comment for why.
-async fn broadcast(http: &reqwest::Client, rpc_url: &str, signed_bytes: &[u8]) -> Result<String, String> {
-    use base64::Engine;
+async fn broadcast(http: &reqwest::Client, rpc_url: &str, signed_bytes: &[u8]) -> Result<String, String> {    use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(signed_bytes);
 
     let rpc_body = serde_json::json!({
@@ -327,20 +326,4 @@ async fn broadcast(http: &reqwest::Client, rpc_url: &str, signed_bytes: &[u8]) -
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| format!("RPC response had no result field: {response_json}"))
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn buy_balance_requirement_includes_fee_buffer_and_priority_fee() {
-        let required = Decimal::new(151, 4);
-        let actual = Decimal::from(10_i64) / Decimal::from(LAMPORTS_PER_SOL)
-            + Decimal::new(1, 4)
-            + Decimal::from(FEE_BUFFER_LAMPORTS) / Decimal::from(LAMPORTS_PER_SOL);
-
-        assert_eq!(actual, required);
-    }
 }

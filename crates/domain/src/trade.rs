@@ -19,6 +19,7 @@ pub struct TradeRecord {
     #[serde(default)]
     pub fee_quote: Decimal,
     pub pnl: Decimal,
+    #[serde(with = "time::serde::rfc3339")]
     pub closed_at: OffsetDateTime,
     #[serde(default)]
     pub execution_price_is_reference: bool,
