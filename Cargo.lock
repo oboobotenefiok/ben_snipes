@@ -181,6 +181,7 @@ dependencies = [
  "ben_snipes-domain",
  "ben_snipes-ports",
  "rust_decimal",
+ "serde_json",
  "time",
  "tokio",
  "tracing",

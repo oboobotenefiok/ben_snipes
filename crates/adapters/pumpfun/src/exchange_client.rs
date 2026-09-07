@@ -152,13 +152,14 @@ impl PumpPortalExchangeClient {
     /// balance figure) and falls back to the float `uiAmount` field only
     /// if the string form isn't present.
     async fn token_balance(&self, mint: &str) -> Result<Decimal, PortError> {
+        let wallet_pubkey = self.wallet()?.pubkey().to_string();
         with_retry(3, || async {
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "getTokenAccountsByOwner",
                 "params": [
-                    self.wallet()?.pubkey().to_string(),
+                    wallet_pubkey.clone(),
                     { "mint": mint },
                     { "encoding": "jsonParsed" },
                 ],
@@ -202,12 +203,13 @@ impl PumpPortalExchangeClient {
     /// SOL balance of the wallet, in whole SOL (not lamports) - used for
     /// the pre-trade balance check in `submit_buy_by_amount`.
     async fn sol_balance(&self) -> Result<Decimal, PortError> {
+        let wallet_pubkey = self.wallet()?.pubkey().to_string();
         with_retry(3, || async {
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "getBalance",
-                "params": [self.wallet()?.pubkey().to_string()],
+                "params": [wallet_pubkey.clone()],
             });
 
             let response = self
@@ -247,6 +249,7 @@ impl PumpPortalExchangeClient {
     /// transaction fee, while the fee is returned separately. This avoids
     /// treating a pre-trade price quote as a fill.
     async fn solana_settlement(&self, signature: &str) -> Result<(Decimal, Decimal), PortError> {
+        let wallet_pubkey = self.wallet()?.pubkey().to_string();
         with_retry(3, || async {
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -322,7 +325,7 @@ impl PumpPortalExchangeClient {
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| "confirmed transaction did not expose its fee payer".to_string())?;
 
-            if first_account != self.wallet()?.pubkey().to_string() {
+            if first_account != wallet_pubkey.as_str() {
                 return Err("confirmed transaction fee payer did not match configured wallet".to_string());
             }
 

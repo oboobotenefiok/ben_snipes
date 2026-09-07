@@ -190,6 +190,7 @@ async fn build_unsigned_transaction(
         response
             .bytes()
             .await
+            .map(|bytes| bytes.to_vec())
             .map_err(|e| format!("failed to read trade-local response body: {e}"))
     })
     .await

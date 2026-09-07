@@ -21,8 +21,8 @@
 use async_trait::async_trait;
 use ben_snipes_adapter_ws_support::connect_with_backoff;
 use ben_snipes_domain::{
-    Chain, DomainError, FilledBuy, Listing, ListingMetrics, Order, SafetyReport, Symbol, Venue,
-    VenueKind,
+    Chain, DomainError, FilledBuy, FilledSell, Listing, ListingMetrics, Order, SafetyReport,
+    Symbol, Venue, VenueKind,
 };
 use ben_snipes_ports::{
     ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError, TokenSafetyChecker,
