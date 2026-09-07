@@ -4,7 +4,8 @@
     "max_sell_tax_bps": 1000,
     "take_profit_percent": "10",
     "position_size": "100",
-    "max_open_positions": 3
+    "max_open_positions": 3,
+    "max_token_transfer_fee_bps": 0
   },
   "events": [
     {
@@ -17,7 +18,7 @@
       },
       "price": "10",
       "metrics": {"volume_24h": "100000", "market_cap": "500000"},
-      "safety": {"sell_tax_bps": 100, "ownership_renounced": true, "liquidity_locked": false, "is_mintable": false}
+      "safety": {"sell_tax_bps": 100, "ownership_renounced": true, "liquidity_locked": false, "is_mintable": false, "token_transfer_fee_bps": 0, "sellability": "Simulated", "has_permanent_delegate": false}
     },
     {
       "timestamp": "2026-01-01T00:05:00Z",
@@ -29,7 +30,7 @@
       },
       "price": "11",
       "metrics": {"volume_24h": "120000", "market_cap": "550000"},
-      "safety": {"sell_tax_bps": 100, "ownership_renounced": true, "liquidity_locked": false, "is_mintable": false}
+      "safety": {"sell_tax_bps": 100, "ownership_renounced": true, "liquidity_locked": false, "is_mintable": false, "token_transfer_fee_bps": 0, "sellability": "Simulated", "has_permanent_delegate": false}
     }
   ]
 }

@@ -25,6 +25,7 @@ pub struct BacktestEvent {
 pub struct BacktestConfig {
     pub min_volume_24h: Decimal,
     pub max_sell_tax_bps: u32,
+    #[serde(default)]
     pub max_token_transfer_fee_bps: u32,
     pub take_profit_percent: Decimal,
     pub position_size: Decimal,
