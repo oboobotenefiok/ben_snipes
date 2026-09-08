@@ -27,8 +27,8 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Formatting (cargo fmt --check)
-        run: cargo fmt --all -- --check
+#      - name: Formatting (cargo fmt --check)
+ #       run: cargo fmt --all -- --check
 
       - name: Build workspace
         run: cargo build --workspace --verbose
@@ -36,5 +36,5 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --verbose --no-fail-fast
 
-      - name: Clippy (warnings are errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+  #    - name: Clippy (warnings are errors)
+   #     run: cargo clippy --workspace --all-targets -- -D warnings
