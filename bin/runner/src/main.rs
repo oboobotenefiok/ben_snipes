@@ -32,13 +32,19 @@ use ben_snipes_adapter_pumpfun::{
     load_wallet, wallet_pubkey_string, DexScreenerMetricsProvider, NoWalletExchange,
     PumpPortalExchangeClient, PumpPortalSource, RugCheckSafetyChecker,
 };
-use ben_snipes_adapter_statefile::{FileAcquisitionLedger, FilePendingTradeStore, FilePositionStore, FileTradeStore, StatefileStore};
+use ben_snipes_adapter_statefile::{
+    FileAcquisitionLedger, FilePendingTradeStore, FilePositionStore, FileTradeStore, InstanceLock,
+    StatefileStore,
+};
 use ben_snipes_application::{AcquisitionDecision, AcquisitionEngine, NewListingDetector, PaperExchange, PositionManager, RuntimeMetrics, SafetyGate};
 use ben_snipes_config::{AppConfig, ExecutionMode};
 use ben_snipes_domain::{
     AcquisitionCriteria, ListingMetrics, PerformanceSummary, Position, ProfitTarget, SafetyCriteria, SafetyReport, TradeRecord,
 };
-use ben_snipes_ports::{AcquisitionLedger, ExchangeClient, ListingSource, PendingTradeStore, PositionStore, TradeStore};
+use ben_snipes_ports::{
+    AcquisitionLedger, ExchangeClient, ListingSource, PendingTradeStore, PositionStore,
+    SystemClock, TradeStore,
+};
 use rust_decimal::Decimal;
 use std::fmt::Display;
 use std::path::Path;
@@ -328,6 +334,54 @@ async fn build_venues(
 
 #[tokio::main]
 async fn main() {
+    // Handled before anything else - no config, no network, no wallet
+    // access - so `--version`/`--help` are instant and side-effect-free.
+    // This matters beyond convenience: install.sh's post-install self
+    // test runs `./ben_snipes --version` and relies on it actually
+    // exiting immediately. Without this, the binary ignored all CLI
+    // arguments entirely, so that line launched the *real* bot - full
+    // startup, real RPC connections, and (since install.sh has already
+    // sourced .env by that point, including a real SOLANA_PRIVATE_KEY
+    // if the user provided one) potentially real trading - and then
+    // never returned, since the main loop runs forever. That would hang
+    // every fresh install on this exact line.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("ben_snipes {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("ben_snipes {}", env!("CARGO_PKG_VERSION"));
+        println!("A Solana/EVM new-listing trading bot.");
+        println!();
+        println!("Configuration is via config/default.toml and environment");
+        println!("variables (SOLANA_PRIVATE_KEY, etc.) - not CLI flags.");
+        println!();
+        println!("USAGE:");
+        println!("    ben_snipes");
+        println!();
+        println!("OPTIONS:");
+        println!("    -V, --version    Print version and exit");
+        println!("    -h, --help       Print this help and exit");
+        return;
+    }
+
+    // Must happen before any TLS connection is attempted (reqwest calls
+    // in pumpfun/evm-onchain, websocket connects in evm-onchain). Two
+    // different rustls backend crates (ring, aws-lc-rs) are reachable
+    // through this workspace's dependency graph, and rustls refuses to
+    // guess between them - the first TLS handshake panics instead.
+    // Installing one explicitly, once, up front resolves that
+    // deterministically regardless of which adapter makes the first
+    // network call.
+    if rustls::crypto::ring::default_provider().install_default().is_err() {
+        // Only reachable if something else in-process already installed
+        // a provider first - not an error, just means we were beaten to
+        // it (e.g. under a future test harness that runs `main`'s setup
+        // more than once in the same process).
+        eprintln!("rustls crypto provider was already installed; continuing with the existing one");
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -344,6 +398,20 @@ async fn main() {
         eprintln!("invalid runtime configuration: {e}");
         std::process::exit(1);
     }
+
+    // Must happen before any other state file is touched: two processes
+    // racing on the same open-positions/trade-journal files could
+    // double-buy, double-sell, or corrupt the journal. `_instance_lock`
+    // is held for the remaining lifetime of `main` and released (lock
+    // file removed) on drop - i.e. on normal process exit.
+    let instance_lock_path = format!("{}/instance.lock", config.storage.state_dir);
+    let _instance_lock = match InstanceLock::acquire(&instance_lock_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
 
     let risk = RiskParams {
         take_profit: expect_valid_config(
@@ -389,7 +457,7 @@ async fn main() {
     };
 
     let state_store = Arc::new(StatefileStore::new(&config.storage.state_dir));
-    let detector = NewListingDetector::new(state_store);
+    let detector = NewListingDetector::new(state_store, Arc::new(SystemClock));
 
     let ledger_path = format!("{}/acquisition-ledger.json", config.storage.state_dir);
     let ledger: Arc<dyn AcquisitionLedger> = Arc::new(expect_valid_config(

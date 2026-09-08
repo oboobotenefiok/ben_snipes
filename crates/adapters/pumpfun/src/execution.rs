@@ -45,7 +45,7 @@ use crate::retry::with_retry;
 use rust_decimal::Decimal;
 use solana_sdk::signature::Signature;
 use solana_sdk::signer::keypair::Keypair;
-use solana_sdk::signer::Signer;
+use solana_sdk::signer::{SeedDerivable, Signer};
 use solana_sdk::transaction::VersionedTransaction;
 use std::env;
 
@@ -53,20 +53,71 @@ const TRADE_LOCAL_URL: &str = "https://pumpportal.fun/api/trade-local";
 
 /// Loads the wallet keypair from the `SOLANA_PRIVATE_KEY` environment
 /// variable. Never reads from a file this codebase writes, never logs
-/// the value (not even in error messages), and never falls back to a
-/// default - there is no safe default for a private key. Expects the
-/// base58-encoded 64-byte secret key format that `solana-keygen` and
-/// most wallet exports use.
+/// the value (not even in error messages - every error path below
+/// describes *what's wrong*, never echoes `raw` or the decoded bytes),
+/// and never falls back to a default - there is no safe default for a
+/// private key.
+///
+/// Two encodings are accepted, matching how the ecosystem actually
+/// exports keys:
+/// - base58 (no prefix) - what `solana-keygen` and most Solana wallet
+///   exports use.
+/// - hex, `0x`-prefixed - what some wallets/tooling export instead.
+///   The `0x` prefix is required to disambiguate from base58 rather
+///   than guessing from content: hex's alphabet is a subset of
+///   base58's, so an un-prefixed string is always treated as base58.
+///
+/// Both the 64-byte full keypair representation (32-byte secret + its
+/// matching 32-byte public key, what `solana-keygen` writes) and a
+/// bare 32-byte secret seed are accepted - some wallets export only
+/// the seed. Any other decoded length is a malformed key and fails
+/// closed rather than guessing.
+///
+/// **Unverified until first compile** (see this file's module docs):
+/// the 32-byte path uses `solana_sdk::signer::SeedDerivable::from_seed`,
+/// confirmed present at that exact path as of solana-sdk 2.1.x's
+/// published docs, but this crate pins solana-sdk 4.x - the same
+/// Anza-fork restructuring this file already flags elsewhere means
+/// that path should be re-checked against the actual pinned version's
+/// docs.rs page before relying on it with real funds.
 pub fn load_wallet() -> Result<Keypair, String> {
     let raw = env::var("SOLANA_PRIVATE_KEY")
         .map_err(|_| "SOLANA_PRIVATE_KEY environment variable is not set".to_string())?;
 
-    let bytes = bs58::decode(raw.trim())
-        .into_vec()
-        .map_err(|e| format!("SOLANA_PRIVATE_KEY is not valid base58: {e}"))?;
+    let bytes = decode_key_bytes(raw.trim())?;
 
-    Keypair::try_from(bytes.as_slice())
-        .map_err(|e| format!("SOLANA_PRIVATE_KEY did not decode to a valid keypair: {e}"))
+    match bytes.len() {
+        64 => Keypair::try_from(bytes.as_slice())
+            .map_err(|e| format!("SOLANA_PRIVATE_KEY did not decode to a valid keypair: {e}")),
+        32 => Keypair::from_seed(&bytes)
+            .map_err(|e| format!("SOLANA_PRIVATE_KEY (32-byte seed) did not produce a valid keypair: {e}")),
+        other => Err(format!(
+            "SOLANA_PRIVATE_KEY decoded to {other} bytes; expected 32 (a secret seed) or 64 (a full keypair)"
+        )),
+    }
+}
+
+/// Decodes `raw` as hex if it's `0x`-prefixed, otherwise as base58.
+fn decode_key_bytes(raw: &str) -> Result<Vec<u8>, String> {
+    if let Some(hex_digits) = raw.strip_prefix("0x") {
+        return decode_hex(hex_digits);
+    }
+    bs58::decode(raw)
+        .into_vec()
+        .map_err(|e| format!("SOLANA_PRIVATE_KEY is not valid base58 (and has no 0x prefix for hex): {e}"))
+}
+
+fn decode_hex(digits: &str) -> Result<Vec<u8>, String> {
+    if digits.is_empty() || digits.len() % 2 != 0 {
+        return Err("SOLANA_PRIVATE_KEY has an odd number of hex digits after 0x".to_string());
+    }
+    (0..digits.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&digits[i..i + 2], 16)
+                .map_err(|_| "SOLANA_PRIVATE_KEY contains a non-hex character after 0x".to_string())
+        })
+        .collect()
 }
 
 /// Convenience for callers that just want to log/display the wallet's
@@ -326,4 +377,57 @@ async fn broadcast(http: &reqwest::Client, rpc_url: &str, signed_bytes: &[u8]) -
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| format!("RPC response had no result field: {response_json}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_base58_without_a_prefix() {
+        let bytes = decode_key_bytes(&bs58::encode([7u8; 32]).into_string()).expect("valid base58 should decode");
+        assert_eq!(bytes, vec![7u8; 32]);
+    }
+
+    #[test]
+    fn decodes_0x_prefixed_hex() {
+        let hex_str = format!("0x{}", "ab".repeat(32));
+        let bytes = decode_key_bytes(&hex_str).expect("valid 0x-prefixed hex should decode");
+        assert_eq!(bytes, vec![0xabu8; 32]);
+    }
+
+    #[test]
+    fn rejects_odd_length_hex() {
+        let result = decode_key_bytes("0xabc");
+        assert!(result.is_err(), "an odd number of hex digits is malformed and must not silently truncate");
+    }
+
+    #[test]
+    fn rejects_non_hex_characters_after_0x_prefix() {
+        let result = decode_key_bytes("0xzzzz");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_a_string_that_is_neither_valid_hex_nor_valid_base58() {
+        // '0', 'O', 'I', 'l' are all excluded from the base58 alphabet.
+        let result = decode_key_bytes("0OIl-not-a-real-key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_bare_hex_looking_string_without_0x_is_still_treated_as_base58() {
+        // Every character here is a valid base58 character (and happens
+        // to also be a valid hex digit), so without the 0x prefix this
+        // must go through the base58 decoder, not be silently
+        // reinterpreted as hex. Hex-decoding "abcdef" would yield
+        // exactly 3 bytes ([0xab, 0xcd, 0xef]); base58-decoding it does
+        // not, which is what actually distinguishes the two paths here.
+        let decoded = decode_key_bytes("abcdef").expect("should decode as base58");
+        assert_ne!(decoded, vec![0xab, 0xcd, 0xef], "must not have been silently treated as hex");
+        assert_eq!(
+            decoded,
+            bs58::decode("abcdef").into_vec().expect("test fixture should be valid base58")
+        );
+    }
 }

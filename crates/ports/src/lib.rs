@@ -20,7 +20,7 @@ mod token_safety_checker;
 mod trade_store;
 
 pub use acquisition_ledger::AcquisitionLedger;
-pub use clock::Clock;
+pub use clock::{Clock, SystemClock};
 pub use error::PortError;
 pub use exchange_client::ExchangeClient;
 pub use listing_source::{ListingSnapshot, ListingSource};

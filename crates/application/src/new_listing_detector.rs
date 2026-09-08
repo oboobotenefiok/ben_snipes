@@ -1,6 +1,7 @@
 use ben_snipes_domain::Listing;
 use ben_snipes_ports::{
-    KnownListings, ListingSnapshot, ListingSource, ListingStateStore, PendingListing, PortError,
+    Clock, KnownListings, ListingSnapshot, ListingSource, ListingStateStore, PendingListing,
+    PortError,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -44,11 +45,12 @@ fn prune_expired_pending(known: &mut KnownListings, now: OffsetDateTime) {
 
 pub struct NewListingDetector {
     state_store: Arc<dyn ListingStateStore>,
+    clock: Arc<dyn Clock>,
 }
 
 impl NewListingDetector {
-    pub fn new(state_store: Arc<dyn ListingStateStore>) -> Self {
-        Self { state_store }
+    pub fn new(state_store: Arc<dyn ListingStateStore>, clock: Arc<dyn Clock>) -> Self {
+        Self { state_store, clock }
     }
 
     pub async fn poll(
@@ -68,7 +70,7 @@ impl NewListingDetector {
                     let key = listing.dedupe_key();
                     known.seen_keys.insert(key.clone());
                     known.pending.entry(key).or_insert_with(|| {
-                        PendingListing::new(listing.clone(), OffsetDateTime::now_utc())
+                        PendingListing::new(listing.clone(), self.clock.now())
                     });
                 }
                 known.cursor = cursor;
@@ -96,14 +98,14 @@ impl NewListingDetector {
                     let key = listing.dedupe_key();
                     known.seen_keys.insert(key.clone());
                     known.pending.entry(key).or_insert_with(|| {
-                        PendingListing::new(listing.clone(), OffsetDateTime::now_utc())
+                        PendingListing::new(listing.clone(), self.clock.now())
                     });
                 }
                 fresh
             }
         };
 
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now();
         prune_expired_pending(&mut known, now);
 
         if retry_pending {
@@ -155,7 +157,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use ben_snipes_domain::{Chain, Symbol, Venue, VenueKind};
-    use ben_snipes_ports::KnownListings;
+    use ben_snipes_ports::{KnownListings, SystemClock};
     use std::sync::Mutex;
     use time::OffsetDateTime;
 
@@ -218,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn first_poll_establishes_baseline_and_reports_nothing_new() {
         let store = Arc::new(InMemoryStateStore::empty());
-        let detector = NewListingDetector::new(store);
+        let detector = NewListingDetector::new(store, Arc::new(SystemClock));
         let source = FixedFullSnapshotSource {
             listings: vec![listing("AAAUSDT"), listing("BBBUSDT")],
         };
@@ -233,7 +235,7 @@ mod tests {
     #[tokio::test]
     async fn second_poll_with_same_snapshot_returns_nothing_new() {
         let store = Arc::new(InMemoryStateStore::empty());
-        let detector = NewListingDetector::new(store);
+        let detector = NewListingDetector::new(store, Arc::new(SystemClock));
         let source = FixedFullSnapshotSource {
             listings: vec![listing("AAAUSDT")],
         };
@@ -248,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn diff_only_surfaces_the_genuinely_new_symbol_after_baseline() {
         let store = Arc::new(InMemoryStateStore::empty());
-        let detector = NewListingDetector::new(store);
+        let detector = NewListingDetector::new(store, Arc::new(SystemClock));
 
         let first_source = FixedFullSnapshotSource {
             listings: vec![listing("AAAUSDT")],
@@ -273,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn pending_listing_is_retried_without_becoming_a_new_listing_again() {
         let store = Arc::new(InMemoryStateStore::empty());
-        let detector = NewListingDetector::new(store);
+        let detector = NewListingDetector::new(store, Arc::new(SystemClock));
         let source = FixedFullSnapshotSource {
             listings: vec![listing("PENDING")],
         };

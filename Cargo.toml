@@ -20,6 +20,18 @@ members = [
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Pulled in directly (not just transitively via reqwest/tokio-tungstenite)
+# so the runner can explicitly install a single process-wide crypto
+# provider at startup. reqwest's `rustls-tls` and tokio-tungstenite's
+# `rustls-tls-webpki-roots` don't agree on a default backend (aws-lc-rs
+# vs ring), and having both linked in leaves rustls unable to
+# auto-select one - it panics on the first TLS handshake instead of
+# guessing. `ring` is the deliberate choice here, not aws-lc-rs: this
+# project ships an Android/Termux build (see the release workflow),
+# and aws-lc-rs needs a C/C++ toolchain (cmake, clang) to build, which
+# is a much rougher requirement on Termux than ring's prebuilt-friendly
+# pure-Rust-plus-assembly approach.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures-util = "0.3"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }

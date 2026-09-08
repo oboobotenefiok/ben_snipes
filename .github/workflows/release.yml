@@ -142,19 +142,33 @@ jobs:
           # Download the appropriate binary
           # For ARM64 (most common):
           curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/ben_snipes-arm64
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/ben_snipes-arm64.sha256
+
+          # Verify checksum BEFORE renaming - the .sha256 file names the
+          # downloaded file by its original name, so it must still exist
+          # under that name when this runs.
+          sha256sum -c ben_snipes-arm64.sha256
+
           chmod +x ben_snipes-arm64
           mv ben_snipes-arm64 ben_snipes
-
-          # Verify checksum
-          sha256sum -c ben_snipes-arm64.sha256
           ```
 
           ## Configuration
 
-          After installation, run the setup script to configure your environment:
+          If you used **Quick Install** above, `install.sh` already created a
+          `.env` file and a `ben_snipes-wrapper` script that loads it - run:
 
           ```bash
           ./ben_snipes-wrapper
+          ```
+
+          If you used **Manual Install**, there's no `.env`/wrapper (those are
+          only created by `install.sh`) - set your environment variables
+          directly and run the binary itself:
+
+          ```bash
+          SOLANA_PRIVATE_KEY=your_key_here ./ben_snipes
+          # or leave SOLANA_PRIVATE_KEY unset to run in detection-only mode
           ```
 
           ## Changelog

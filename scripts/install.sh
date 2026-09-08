@@ -61,9 +61,21 @@ echo -e "${GREEN}Latest version: $LATEST_VERSION${NC}"
 
 # Download based on architecture
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_VERSION/ben_snipes-$ARCH"
-curl -L -o "$INSTALL_DIR/ben_snipes" "$DOWNLOAD_URL"
+CHECKSUM_URL="$DOWNLOAD_URL.sha256"
+curl -L -o "$INSTALL_DIR/ben_snipes-$ARCH" "$DOWNLOAD_URL"
+curl -L -o "$INSTALL_DIR/ben_snipes-$ARCH.sha256" "$CHECKSUM_URL"
+
+echo -e "${GREEN}Verifying checksum...${NC}"
+if ! (cd "$INSTALL_DIR" && sha256sum -c "ben_snipes-$ARCH.sha256"); then
+    echo -e "${RED}Checksum verification failed - the downloaded binary does not match the published release.${NC}"
+    echo -e "${RED}Refusing to install a binary that failed integrity verification. Not deleting the file so you can inspect it: $INSTALL_DIR/ben_snipes-$ARCH${NC}"
+    exit 1
+fi
+
+mv "$INSTALL_DIR/ben_snipes-$ARCH" "$INSTALL_DIR/ben_snipes"
+rm -f "$INSTALL_DIR/ben_snipes-$ARCH.sha256"
 chmod +x "$INSTALL_DIR/ben_snipes"
-echo -e "${GREEN}Binary downloaded and made executable${NC}"
+echo -e "${GREEN}Binary downloaded, verified, and made executable${NC}"
 
 # 2. Create config directory in the installation location
 echo -e "${GREEN}Creating configuration directory...${NC}"
@@ -249,7 +261,7 @@ echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━�
 
 cd "$INSTALL_DIR"
 echo -e "${GREEN}Testing binary...${NC}"
-./ben_snipes --version 2>/dev/null || echo -e "${YELLOW}Version check skipped (--version not implemented)${NC}"
+./ben_snipes --version
 
 echo ""
 echo -e "${GREEN}Installation complete!${NC}"
@@ -266,7 +278,7 @@ echo ""
 echo -e "${YELLOW}3.${NC} Run the bot: ${BLUE}cd $INSTALL_DIR && ./ben_snipes-wrapper${NC}"
 echo -e "${YELLOW}   ${NC}Or from anywhere: ${BLUE}ben_snipes${NC} (if ~/.local/bin is in PATH)"
 echo ""
-echo -e "${YELLOW}4.${NC} To update: ${BLUE}./ben_snipes-wrapper --update${NC}"
+echo -e "${YELLOW}4.${NC} To update: stop the running bot first, then re-run this installer from ${BLUE}$INSTALL_DIR${NC} - it re-downloads the latest binary and overwrites the old one in place. ${RED}Do not update while the bot is running${NC} - overwriting the binary file out from under a running process can corrupt it mid-trade."
 echo ""
 echo -e "${YELLOW}5.${NC} Monitor logs: ${BLUE}RUST_LOG=info ./ben_snipes-wrapper${NC}"
 echo ""

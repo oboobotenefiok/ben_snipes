@@ -22,3 +22,4 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rust_decimal = { workspace = true }
+rustls = { workspace = true }

@@ -14,9 +14,11 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tracing::debug;
 
+mod instance_lock;
 mod ledger;
 mod position_store;
 mod trade_store;
+pub use instance_lock::InstanceLock;
 pub use ledger::FileAcquisitionLedger;
 pub use position_store::FilePositionStore;
 pub use trade_store::{FilePendingTradeStore, FileTradeStore};
