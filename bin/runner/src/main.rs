@@ -478,6 +478,15 @@ async fn main() {
                         warn!(error = %error, "failed to persist pending trade journal queue");
                     }
                     performance = PerformanceSummary::from_trades(&trade_history);
+                    info!(
+                        trades = performance.trade_count,
+                        wins = performance.winning_trades,
+                        losses = performance.losing_trades,
+                        flat = performance.flat_trades,
+                        realized_pnl = %performance.realized_pnl,
+                        pending_remaining = pending_trades.len(),
+                        "pending trade journal retry flushed"
+                    );
                 }
 
                 // 1. Scan every venue for newly-appeared listings. New entries
@@ -655,6 +664,14 @@ async fn main() {
                                     // silently dropping the record.
                                     trade_history.push(trade.clone());
                                     performance = PerformanceSummary::from_trades(&trade_history);
+                                    info!(
+                                        trades = performance.trade_count,
+                                        wins = performance.winning_trades,
+                                        losses = performance.losing_trades,
+                                        flat = performance.flat_trades,
+                                        realized_pnl = %performance.realized_pnl,
+                                        "performance updated from an unjournaled trade pending durable retry"
+                                    );
                                     pending_trades.push(trade);
                                     if let Err(persist_err) = pending_trade_store.save(&pending_trades).await {
                                         runtime_metrics.inc_journal_errors();

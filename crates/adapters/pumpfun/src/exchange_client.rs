@@ -495,8 +495,8 @@ mod tests {
 
     #[test]
     fn buy_balance_requirement_includes_fee_buffer_and_priority_fee() {
-        let quote_amount = Decimal::from(10_i64) / Decimal::from(LAMPORTS_PER_SOL);
-        let priority_fee_sol = Decimal::new(1, 4);
+        let quote_amount = Decimal::new(1, 2); // 0.01 SOL
+        let priority_fee_sol = Decimal::new(1, 4); // 0.0001 SOL
         let required_balance =
             quote_amount + priority_fee_sol + Decimal::from(FEE_BUFFER_LAMPORTS) / Decimal::from(LAMPORTS_PER_SOL);
 
