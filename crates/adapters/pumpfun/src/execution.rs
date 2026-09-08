@@ -60,18 +60,32 @@ const TRADE_LOCAL_URL: &str = "https://pumpportal.fun/api/trade-local";
 ///
 /// Two encodings are accepted, matching how the ecosystem actually
 /// exports keys:
-/// - base58 (no prefix) - what `solana-keygen` and most Solana wallet
+/// - base58 - what `solana-keygen` and most Solana-native wallet
 ///   exports use.
-/// - hex, `0x`-prefixed - what some wallets/tooling export instead.
-///   The `0x` prefix is required to disambiguate from base58 rather
-///   than guessing from content: hex's alphabet is a subset of
-///   base58's, so an un-prefixed string is always treated as base58.
+/// - hex, with or without a `0x`/`0X` prefix - what EVM-first wallets
+///   (Trust Wallet among them) export instead, frequently *without*
+///   the prefix. Detection is by content and length, not by prefix -
+///   see `decode_key_bytes` for why that's safe rather than a guess.
 ///
 /// Both the 64-byte full keypair representation (32-byte secret + its
 /// matching 32-byte public key, what `solana-keygen` writes) and a
 /// bare 32-byte secret seed are accepted - some wallets export only
 /// the seed. Any other decoded length is a malformed key and fails
 /// closed rather than guessing.
+///
+/// **This function cannot detect a key from the wrong curve.** Solana
+/// uses ed25519; EVM chains use secp256k1. Any 32 bytes deterministically
+/// produce *some* valid ed25519 keypair - ed25519 has no "invalid
+/// scalar" rejection the way secp256k1 does - so an Ethereum/BNB/
+/// Polygon private key exported from a multi-chain wallet (Trust
+/// Wallet, MetaMask, etc.) will decode and construct a keypair here
+/// without error, but that keypair's Solana address has no
+/// relationship whatsoever to the EVM address the key actually
+/// controls, or to any funds the operator thinks it holds. There is no
+/// way to detect this case from the bytes alone - only the operator
+/// knows which chain's key they exported. When configuring this,
+/// confirm the wallet app was showing the *Solana* account specifically
+/// before copying its private key.
 ///
 /// **Unverified until first compile** (see this file's module docs):
 /// the 32-byte path uses `solana_sdk::signer::SeedDerivable::from_seed`,
@@ -97,14 +111,44 @@ pub fn load_wallet() -> Result<Keypair, String> {
     }
 }
 
-/// Decodes `raw` as hex if it's `0x`-prefixed, otherwise as base58.
+/// Decodes `raw` into raw key bytes, accepting hex (with or without a
+/// `0x`/`0X` prefix - Trust Wallet's export, among others, has no
+/// prefix) or base58 (what `solana-keygen` and most Solana-native
+/// wallet exports use), auto-detecting which one `raw` actually is.
+///
+/// The detection is content- and length-based, not prefix-based: a
+/// string made entirely of hex digits, of even length, is treated as
+/// hex. This is safe rather than a guess, for two independent reasons:
+/// - Base58's alphabet excludes '0' entirely (to avoid confusion with
+///   'O'), so any candidate containing a literal '0' cannot be valid
+///   base58 in the first place - if it's also all-hex-digit, hex is
+///   the *only* valid interpretation, not merely the likely one.
+/// - Even for candidates that avoid '0' and coincidentally sit inside
+///   hex's 16-character alphabet, length rules out any real collision:
+///   a genuine base58-encoded 32-byte key is ~44 characters and a
+///   64-byte key ~87-88, while their hex equivalents are exactly 64
+///   and 128 - the lengths this function is ever asked to decode never
+///   overlap between the two encodings.
+/// A malformed key will fail decoding either way and produce a clear
+/// error rather than silently succeeding with the wrong bytes; the
+/// byte-length check in `load_wallet` is a second, independent
+/// safety net against exactly that.
 fn decode_key_bytes(raw: &str) -> Result<Vec<u8>, String> {
-    if let Some(hex_digits) = raw.strip_prefix("0x") {
-        return decode_hex(hex_digits);
+    let hex_candidate = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")).unwrap_or(raw);
+    let looks_like_hex = !hex_candidate.is_empty()
+        && hex_candidate.len() % 2 == 0
+        && hex_candidate.bytes().all(|b| b.is_ascii_hexdigit());
+
+    if looks_like_hex {
+        return decode_hex(hex_candidate);
     }
-    bs58::decode(raw)
-        .into_vec()
-        .map_err(|e| format!("SOLANA_PRIVATE_KEY is not valid base58 (and has no 0x prefix for hex): {e}"))
+
+    bs58::decode(raw).into_vec().map_err(|e| {
+        format!(
+            "SOLANA_PRIVATE_KEY is neither a hex-digit string of even length \
+             (with or without a 0x prefix) nor valid base58: {e}"
+        )
+    })
 }
 
 fn decode_hex(digits: &str) -> Result<Vec<u8>, String> {
@@ -409,25 +453,40 @@ mod tests {
     }
 
     #[test]
+    fn decodes_hex_without_a_0x_prefix() {
+        // The exact case that motivated this: Trust Wallet's private
+        // key export has no 0x prefix.
+        let bytes = decode_key_bytes(&"ab".repeat(32)).expect("bare hex should decode");
+        assert_eq!(bytes, vec![0xabu8; 32]);
+    }
+
+    #[test]
     fn rejects_a_string_that_is_neither_valid_hex_nor_valid_base58() {
-        // '0', 'O', 'I', 'l' are all excluded from the base58 alphabet.
+        // '0', 'O', 'I', 'l' are all excluded from the base58 alphabet,
+        // and this isn't all-hex-digit either.
         let result = decode_key_bytes("0OIl-not-a-real-key");
         assert!(result.is_err());
     }
 
     #[test]
-    fn a_bare_hex_looking_string_without_0x_is_still_treated_as_base58() {
-        // Every character here is a valid base58 character (and happens
-        // to also be a valid hex digit), so without the 0x prefix this
-        // must go through the base58 decoder, not be silently
-        // reinterpreted as hex. Hex-decoding "abcdef" would yield
-        // exactly 3 bytes ([0xab, 0xcd, 0xef]); base58-decoding it does
-        // not, which is what actually distinguishes the two paths here.
-        let decoded = decode_key_bytes("abcdef").expect("should decode as base58");
-        assert_ne!(decoded, vec![0xab, 0xcd, 0xef], "must not have been silently treated as hex");
-        assert_eq!(
-            decoded,
-            bs58::decode("abcdef").into_vec().expect("test fixture should be valid base58")
-        );
+    fn base58_containing_a_literal_zero_is_never_misread_as_hex() {
+        // '0' is excluded from base58's alphabet specifically to avoid
+        // confusion with 'O', so a string containing '0' can only ever
+        // be intended as hex, never base58 - this pins down that the
+        // detection doesn't get that backwards.
+        let hex_str = "0".repeat(64);
+        let bytes = decode_key_bytes(&hex_str).expect("all-zero hex should decode");
+        assert_eq!(bytes, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn a_genuine_base58_key_is_not_misdetected_as_hex() {
+        // A real base58-encoded 32-byte key is ~44 characters, not the
+        // 64 hex-digit-and-even-length shape decode_key_bytes looks
+        // for, so it must fall through to the base58 path uncorrupted.
+        let original = [7u8; 32];
+        let encoded = bs58::encode(original).into_string();
+        let decoded = decode_key_bytes(&encoded).expect("valid base58 should decode");
+        assert_eq!(decoded, original.to_vec());
     }
 }
