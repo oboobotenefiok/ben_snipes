@@ -9,7 +9,10 @@
 //! depend on Flashbots-specific RPC methods.
 
 use alloy::{
-    network::{eip2718::Encodable2718, EthereumWallet, NetworkTransactionBuilder, ReceiptResponse},
+    network::{
+        eip2718::Encodable2718, EthereumWallet, NetworkTransactionBuilder, ReceiptResponse,
+        TransactionBuilder,
+    },
     primitives::{Address, Bytes, U256},
     providers::{Provider, ProviderBuilder},
     rpc::types::TransactionRequest,
@@ -516,7 +519,8 @@ impl EvmUniswapV2Exchange {
     }
 
     fn native_from_wei(amount: U256) -> Result<Decimal, PortError> {
-        let wei = amount.to_u128().ok_or_else(|| PortError::Rejected("native amount exceeds decimal conversion range".to_string()))?;
+        let wei = u128::try_from(amount)
+            .map_err(|_| PortError::Rejected("native amount exceeds decimal conversion range".to_string()))?;
         Ok(Decimal::from(wei) / Decimal::from(1_000_000_000_000_000_000u64))
     }
 
@@ -568,7 +572,9 @@ impl ExchangeClient for EvmUniswapV2Exchange {
         let quantity_raw = after.checked_sub(before).ok_or_else(|| PortError::Rejected("token balance decreased after buy".to_string()))?;
         if quantity_raw.is_zero() { return Err(PortError::Rejected("EVM buy succeeded but acquired zero tokens".to_string())); }
         let decimals = self.token_decimals(&provider, token).await?;
-        let quantity = Decimal::from(quantity_raw.to_u128().ok_or_else(|| PortError::Rejected("token balance exceeds supported precision".to_string()))?)
+        let quantity_raw_u128 = u128::try_from(quantity_raw)
+            .map_err(|_| PortError::Rejected("token balance exceeds supported precision".to_string()))?;
+        let quantity = Decimal::from(quantity_raw_u128)
             / Decimal::from(10_u128.checked_pow(decimals as u32).ok_or_else(|| PortError::Rejected("token decimals too large".to_string()))?);
         let entry_price = quote_amount / quantity;
         Ok(FilledBuy { quantity, entry_price })
@@ -586,7 +592,8 @@ impl ExchangeClient for EvmUniswapV2Exchange {
             .map_err(|e| PortError::Rejected(format!("failed to read token allowance: {e}")))?;
         let mut fee_quote = Decimal::ZERO;
         if allowance < amount {
-            let approve = Erc20::new(token, &provider).approve(self.router, amount);
+            let erc20 = Erc20::new(token, &provider);
+            let approve = erc20.approve(self.router, amount);
             approve.call().await.map_err(|e| PortError::Rejected(format!("token approval preflight failed: {e}")))?;
             let approval_receipt = self.send_private_transaction(&provider, token, U256::ZERO, approve.calldata().to_owned()).await?;
             if !approval_receipt.status() { return Err(PortError::Rejected("token approval transaction reverted".to_string())); }
