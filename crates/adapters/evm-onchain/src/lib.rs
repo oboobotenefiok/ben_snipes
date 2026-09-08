@@ -627,7 +627,7 @@ impl ExchangeClient for EvmUniswapV2Exchange {
             execution_price: Some(execution_price),
             quote_proceeds: Some(quote_proceeds),
             fee_quote: Some(fee_quote),
-            tx_id: Some(format!("{}", receipt.transaction_hash)),
+            tx_id: Some(receipt.transaction_hash.to_string()),
         })
     }
 }

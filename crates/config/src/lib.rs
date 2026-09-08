@@ -14,21 +14,16 @@ pub enum ConfigError {
     Load(#[from] config::ConfigError),
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionMode {
     /// Detection and real execution when wallets are configured.
+    #[default]
     Live,
     /// Run the complete strategy with real market data but simulate orders.
     Paper,
     /// Detect and evaluate listings, but never attempt acquisition or exits.
     DetectionOnly,
-}
-
-impl Default for ExecutionMode {
-    fn default() -> Self {
-        Self::Live
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
