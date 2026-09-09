@@ -72,24 +72,6 @@ pub struct RiskConfig {
 }
 
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct ObservabilityConfig {
-    /// Local HTTP bind address for the Prometheus-compatible `/metrics`
-    /// endpoint. Keep this on loopback unless access control is provided
-    /// by the deployment environment.
-    #[serde(default = "default_metrics_bind")]
-    pub metrics_bind: String,
-    #[serde(default = "default_price_cache_ttl_seconds")]
-    pub price_cache_ttl_seconds: u64,
-    #[serde(default = "default_jupiter_max_retries")]
-    pub jupiter_max_retries: u32,
-    #[serde(default = "default_jupiter_circuit_breaker_failures")]
-    pub jupiter_circuit_breaker_failures: u32,
-    #[serde(default = "default_jupiter_circuit_breaker_cooldown_seconds")]
-    pub jupiter_circuit_breaker_cooldown_seconds: u64,
-}
-
-fn default_metrics_bind() -> String { "127.0.0.1:9090".to_string() }
 fn default_price_cache_ttl_seconds() -> u64 { 30 }
 fn default_jupiter_max_retries() -> u32 { 3 }
 fn default_jupiter_circuit_breaker_failures() -> u32 { 3 }
@@ -127,6 +109,22 @@ pub struct SolanaConfig {
     /// API on every buy/sell - helps transactions land faster under
     /// network congestion.
     pub priority_fee_sol: Decimal,
+
+    /// How long a Jupiter-sourced price stays valid in the shared price
+    /// cache before it's considered stale and re-fetched.
+    #[serde(default = "default_price_cache_ttl_seconds")]
+    pub price_cache_ttl_seconds: u64,
+    /// How many times a Jupiter batch price request is retried (with
+    /// backoff) before giving up.
+    #[serde(default = "default_jupiter_max_retries")]
+    pub jupiter_max_retries: u32,
+    /// Consecutive Jupiter request failures before the circuit breaker
+    /// opens and price lookups are skipped until the cooldown elapses.
+    #[serde(default = "default_jupiter_circuit_breaker_failures")]
+    pub jupiter_circuit_breaker_failures: u32,
+    /// How long the Jupiter circuit breaker stays open once tripped.
+    #[serde(default = "default_jupiter_circuit_breaker_cooldown_seconds")]
+    pub jupiter_circuit_breaker_cooldown_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -169,8 +167,6 @@ fn default_evm_slippage_percent() -> u32 { 10 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub risk: RiskConfig,
-    #[serde(default)]
-    pub observability: ObservabilityConfig,
     pub storage: StorageConfig,
     pub solana: SolanaConfig,
     /// Zero or more EVM chains to watch - one `EvmFactoryLogSource` gets

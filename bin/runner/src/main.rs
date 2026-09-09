@@ -24,7 +24,7 @@ use ben_snipes_adapter_statefile::{
     FileAcquisitionLedger, FilePendingTradeStore, FilePositionStore, FileTradeStore, InstanceLock,
     StatefileStore,
 };
-use ben_snipes_application::{AcquisitionDecision, AcquisitionEngine, NewListingDetector, PositionManager, RuntimeMetrics};
+use ben_snipes_application::{AcquisitionDecision, AcquisitionEngine, NewListingDetector, PositionManager};
 use ben_snipes_config::AppConfig;
 use ben_snipes_domain::{
     AcquisitionCriteria, PerformanceSummary, Position, ProfitTarget, TradeRecord,
@@ -37,7 +37,6 @@ use rust_decimal::Decimal;
 use std::fmt::Display;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -48,7 +47,6 @@ struct VenueHandle {
     source: Box<dyn ListingSource>,
     acquisition: AcquisitionEngine,
     position_manager: PositionManager,
-    price_metrics: Option<Arc<ben_snipes_adapter_pumpfun::PumpPortalExchangeClient>>,
 }
 
 /// Config values that violate a domain rule are a startup-time problem,
@@ -70,44 +68,6 @@ struct RiskParams {
 }
 
 
-async fn serve_metrics(listener: tokio::net::TcpListener, metrics: Arc<RuntimeMetrics>) {
-    loop {
-        let (mut socket, _) = match listener.accept().await {
-            Ok(connection) => connection,
-            Err(e) => {
-                warn!(error = %e, "metrics listener accept failed");
-                continue;
-            }
-        };
-
-        let metrics = metrics.clone();
-        tokio::spawn(async move {
-            let mut request = [0_u8; 1024];
-            let read = match socket.read(&mut request).await {
-                Ok(read) => read,
-                Err(e) => {
-                    warn!(error = %e, "metrics request read failed");
-                    return;
-                }
-            };
-
-            let request = String::from_utf8_lossy(&request[..read]);
-            let (status, content_type, body) = if request.starts_with("GET /metrics ") {
-                ("200 OK", "text/plain; version=0.0.4", metrics.render_prometheus())
-            } else {
-                ("404 Not Found", "text/plain; charset=utf-8", "not found\n".to_string())
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            if let Err(e) = socket.write_all(response.as_bytes()).await {
-                warn!(error = %e, "metrics response write failed");
-            }
-        });
-    }
-}
-
 fn validate_runtime_config(config: &AppConfig) -> Result<(), String> {
     if config.risk.poll_interval_seconds == 0 {
         return Err("risk.poll_interval_seconds must be greater than zero".to_string());
@@ -124,17 +84,17 @@ fn validate_runtime_config(config: &AppConfig) -> Result<(), String> {
     if config.risk.pending_listing_retry_seconds == 0 {
         return Err("risk.pending_listing_retry_seconds must be greater than zero".to_string());
     }
-    if config.observability.price_cache_ttl_seconds == 0 {
-        return Err("observability.price_cache_ttl_seconds must be greater than zero".to_string());
+    if config.solana.price_cache_ttl_seconds == 0 {
+        return Err("solana.price_cache_ttl_seconds must be greater than zero".to_string());
     }
-    if config.observability.jupiter_max_retries == 0 {
-        return Err("observability.jupiter_max_retries must be greater than zero".to_string());
+    if config.solana.jupiter_max_retries == 0 {
+        return Err("solana.jupiter_max_retries must be greater than zero".to_string());
     }
-    if config.observability.jupiter_circuit_breaker_failures == 0 {
-        return Err("observability.jupiter_circuit_breaker_failures must be greater than zero".to_string());
+    if config.solana.jupiter_circuit_breaker_failures == 0 {
+        return Err("solana.jupiter_circuit_breaker_failures must be greater than zero".to_string());
     }
-    if config.observability.jupiter_circuit_breaker_cooldown_seconds == 0 {
-        return Err("observability.jupiter_circuit_breaker_cooldown_seconds must be greater than zero".to_string());
+    if config.solana.jupiter_circuit_breaker_cooldown_seconds == 0 {
+        return Err("solana.jupiter_circuit_breaker_cooldown_seconds must be greater than zero".to_string());
     }
     if config.solana.priority_fee_sol < Decimal::ZERO {
         return Err("solana.priority_fee_sol must not be negative".to_string());
@@ -178,10 +138,10 @@ async fn build_venues(
         config.solana.rpc_url.clone(),
         config.solana.slippage_percent,
         config.solana.priority_fee_sol,
-        Duration::from_secs(config.observability.price_cache_ttl_seconds),
-        config.observability.jupiter_max_retries,
-        config.observability.jupiter_circuit_breaker_failures,
-        Duration::from_secs(config.observability.jupiter_circuit_breaker_cooldown_seconds),
+        Duration::from_secs(config.solana.price_cache_ttl_seconds),
+        config.solana.jupiter_max_retries,
+        config.solana.jupiter_circuit_breaker_failures,
+        Duration::from_secs(config.solana.jupiter_circuit_breaker_cooldown_seconds),
     ));
     let solana_metrics = Arc::new(DexScreenerMetricsProvider::new());
 
@@ -195,7 +155,6 @@ async fn build_venues(
             config.risk.max_position_size,
         ),
         position_manager: PositionManager::new(solana_exchange.clone()),
-        price_metrics: Some(solana_exchange.clone()),
         source: Box::new(pumpfun_source),
     });
 
@@ -239,7 +198,6 @@ async fn build_venues(
                 config.risk.max_position_size,
             ),
             position_manager: PositionManager::new(evm_exchange),
-            price_metrics: None,
             source: Box::new(source),
         });
     }
@@ -352,18 +310,6 @@ async fn main() {
         "ben_snipes starting up"
     );
 
-    let runtime_metrics = RuntimeMetrics::new();
-    let metrics_listener = match tokio::net::TcpListener::bind(&config.observability.metrics_bind).await {
-        Ok(listener) => {
-            info!(bind = %config.observability.metrics_bind, "metrics endpoint listening");
-            Some(tokio::spawn(serve_metrics(listener, runtime_metrics.clone())))
-        }
-        Err(e) => {
-            warn!(bind = %config.observability.metrics_bind, error = %e, "metrics endpoint disabled because bind failed");
-            None
-        }
-    };
-
     let state_store = Arc::new(StatefileStore::new(&config.storage.state_dir));
     let detector = NewListingDetector::new(state_store, Arc::new(SystemClock));
 
@@ -408,7 +354,6 @@ async fn main() {
             "removed positions already present in the persistent trade journal during recovery"
         );
     }
-    runtime_metrics.set_open_positions(open_positions.len());
     let mut performance = PerformanceSummary::from_trades(&trade_history);
     info!(
         trades = performance.trade_count,
@@ -440,7 +385,6 @@ async fn main() {
                                 if !trade_history.iter().any(|existing| existing.key() == trade.key()) {
                                     trade_history.push(trade);
                                 }
-                                runtime_metrics.inc_journal_recoveries();
                             }
                             Err(error) => {
                                 warn!(symbol = trade.symbol.as_str(), error = %error, "pending trade journal retry failed");
@@ -450,7 +394,6 @@ async fn main() {
                     }
                     pending_trades = remaining;
                     if let Err(error) = pending_trade_store.save(&pending_trades).await {
-                        runtime_metrics.inc_journal_errors();
                         warn!(error = %error, "failed to persist pending trade journal queue");
                     }
                     performance = PerformanceSummary::from_trades(&trade_history);
@@ -486,18 +429,15 @@ async fn main() {
                 }
 
                 for venue in &venues {
-                    runtime_metrics.inc_polls();
                     let new_listings = match detector.poll(venue.source.as_ref(), retry_pending).await {
                         Ok(listings) => listings,
                         Err(e) => {
-                            runtime_metrics.inc_poll_errors();
                             consecutive_failures = consecutive_failures.saturating_add(1);
                             warn!(source = venue.source.source_id(), error = %e, "poll failed, will retry next tick");
                             continue;
                         }
                     };
 
-                    runtime_metrics.inc_listings_detected(new_listings.len());
                     detected_this_cycle = detected_this_cycle.saturating_add(new_listings.len());
                     if detected_this_cycle > config.risk.max_new_listings_per_cycle {
                         warn!(
@@ -525,7 +465,6 @@ async fn main() {
 
                         match venue.acquisition.evaluate_and_buy(&listing).await {
                             Ok(AcquisitionDecision::Opened(position)) => {
-                                runtime_metrics.inc_positions_opened();
                                 consecutive_failures = 0;
                                 if let Err(e) = detector.resolve(venue.source.as_ref(), &listing, false).await {
                                     consecutive_failures = consecutive_failures.saturating_add(1);
@@ -538,19 +477,16 @@ async fn main() {
                                     "position opened, now watching for take-profit"
                                 );
                                 open_positions.push(position);
-                                runtime_metrics.set_open_positions(open_positions.len());
                                 if let Err(e) = position_store.save(&open_positions).await {
                                     consecutive_failures = consecutive_failures.saturating_add(1);
                                     warn!(error = %e, "failed to persist open positions after a buy; position is still tracked in memory this run");
                                 }
                             }
                             Ok(AcquisitionDecision::Pending) => {
-                                runtime_metrics.inc_pending_decisions();
                                 consecutive_failures = 0;
                                 info!(symbol = listing.symbol.as_str(), "listing lacks required external data yet; retained for retry");
                             }
                             Ok(AcquisitionDecision::Rejected) => {
-                                runtime_metrics.inc_rejected_decisions();
                                 consecutive_failures = 0;
                                 if let Err(e) = detector.resolve(venue.source.as_ref(), &listing, false).await {
                                     consecutive_failures = consecutive_failures.saturating_add(1);
@@ -559,7 +495,6 @@ async fn main() {
                                 info!(symbol = listing.symbol.as_str(), "listing did not qualify for acquisition");
                             }
                             Err(e) => {
-                                runtime_metrics.inc_buy_errors();
                                 consecutive_failures = consecutive_failures.saturating_add(1);
                                 warn!(symbol = listing.symbol.as_str(), error = %e, "acquisition attempt failed; retaining listing for retry");
                             }
@@ -579,28 +514,23 @@ async fn main() {
                     if venue_positions.is_empty() {
                         continue;
                     }
-                    runtime_metrics.inc_exit_checks_by(venue_positions.len());
                     match venue.position_manager.check_and_exit_batch(&venue_positions).await {
-                        // Keep Prometheus price-cache counters synchronized with the shared Solana cache.
                         Ok(exits) => {
                             for position in venue_positions {
                                 if let Some(exit) = exits.iter().find(|exit| exit.symbol == position.symbol.as_str()) {
                                             let trade = TradeRecord::from_fill(&position, &exit.fill, exit.reference_price, exit.closed_at);
                                     match trade_store.append(&trade).await {
                                         Ok(()) => {
-                                            runtime_metrics.inc_exits_filled();
                                             trade_history.push(trade.clone());
                                             performance = PerformanceSummary::from_trades(&trade_history);
                                             info!(symbol = position.symbol.as_str(), exit_price = %trade.exit_price, tx_id = ?trade.tx_id, pnl = %trade.pnl, "take-profit reached, position closed and journaled");
                                         }
                                         Err(e) => {
-                                            runtime_metrics.inc_journal_errors();
                                             warn!(symbol = position.symbol.as_str(), error = %e, "position closed but failed to persist trade journal entry");
                                             trade_history.push(trade.clone());
                                             performance = PerformanceSummary::from_trades(&trade_history);
                                             pending_trades.push(trade);
                                             if let Err(persist_err) = pending_trade_store.save(&pending_trades).await {
-                                                runtime_metrics.inc_journal_errors();
                                                 warn!(error = %persist_err, "failed to persist pending trade journal queue");
                                             }
                                         }
@@ -611,21 +541,9 @@ async fn main() {
                             }
                         }
                         Err(e) => {
-                            runtime_metrics.inc_exit_errors_by(venue_positions.len());
                             warn!(venue = %venue_name, error = %e, "batched exit check failed; positions retained");
                             still_open.extend(venue_positions);
                         }
-                    }
-                    if let Some(exchange) = &venue.price_metrics {
-                        let stats = exchange.price_cache_stats();
-                        runtime_metrics.set_price_cache_stats(
-                            stats.hits,
-                            stats.misses,
-                            stats.batches,
-                            stats.requested_prices,
-                            stats.latency_ms_total,
-                            stats.latency_samples,
-                        );
                     }
                 }
                 for position in open_positions.drain(..) {
@@ -635,7 +553,6 @@ async fn main() {
                     }
                 }
                 open_positions = still_open;
-                runtime_metrics.set_open_positions(open_positions.len());
                 if let Err(e) = position_store.save(&open_positions).await {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     warn!(error = %e, "failed to persist open positions after exit checks");
@@ -643,9 +560,6 @@ async fn main() {
             }
             _ = &mut shutdown => {
                 info!(open_positions = open_positions.len(), "shutdown signal received, exiting cleanly");
-                if let Some(handle) = metrics_listener {
-                    handle.abort();
-                }
                 break;
             }
         }

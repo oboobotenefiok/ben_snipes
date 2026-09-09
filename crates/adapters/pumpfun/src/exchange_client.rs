@@ -89,10 +89,6 @@ impl PumpPortalExchangeClient {
         }
     }
 
-    pub fn price_cache_stats(&self) -> price_feed::PriceCacheStats {
-        self.price_cache.stats()
-    }
-
     fn wallet(&self) -> &Keypair {
         &self.wallet
     }

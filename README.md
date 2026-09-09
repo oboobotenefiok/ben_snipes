@@ -317,15 +317,3 @@ The acquisition path is intentionally minimal: source-level deduplication, 24h v
 ## License
 
 MIT - see `LICENSE`.
-
-## Historical replay / backtesting
-
-The workspace now includes a deterministic replay engine and `ben_snipes-backtest` binary. It consumes a JSON dataset containing timestamped listing observations, reference prices, 24h volume and market cap, then applies the same volume acquisition criteria, position sizing, maximum-position cap, and take-profit rule used by the application.
-
-Example:
-
-```text
-cargo run -p ben_snipes-backtest -- data/backtest-example.json
-```
-
-This is a **strategy-rule replay**, not a market simulator. It does not claim to reproduce order-book depth, MEV, gas, latency, spread, slippage, partial fills, or venue-specific execution. The report therefore treats the replay price as the reference fill price. Live persistent P&L remains explicitly separate from this historical result.

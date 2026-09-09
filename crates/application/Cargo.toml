@@ -12,7 +12,6 @@ ben_snipes-ports = { workspace = true }
 tracing = { workspace = true }
 rust_decimal = { workspace = true }
 time = { workspace = true }
-serde = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync"] }

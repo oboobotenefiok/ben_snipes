@@ -50,6 +50,13 @@ rpc_url = "https://api.mainnet-beta.solana.com"
 slippage_percent = 10
 priority_fee_sol = "0.0001"
 
+# How long a Jupiter-sourced price stays valid in the shared price
+# cache, and the retry/circuit-breaker tuning for Jupiter price lookups.
+price_cache_ttl_seconds = 30
+jupiter_max_retries = 3
+jupiter_circuit_breaker_failures = 3
+jupiter_circuit_breaker_cooldown_seconds = 60
+
 # Zero or more EVM chains to watch. Each entry spawns one real,
 # websocket-backed ListingSource. There is no usable default for
 # ws_rpc_url or topic0 - both are deployment-specific (your own RPC
@@ -75,12 +82,3 @@ priority_fee_sol = "0.0001"
 # wrapped_native_address = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
 # slippage_percent = 10
 evm_chains = []
-
-[observability]
-# Prometheus-compatible metrics endpoint. Keep this bound to loopback unless
-# the deployment provides its own authentication and network controls.
-metrics_bind = "127.0.0.1:9090"
-price_cache_ttl_seconds = 30
-jupiter_max_retries = 3
-jupiter_circuit_breaker_failures = 3
-jupiter_circuit_breaker_cooldown_seconds = 60

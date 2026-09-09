@@ -7,7 +7,7 @@
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -81,40 +81,6 @@ impl JupiterCircuitBreaker {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PriceCacheStats {
-    pub hits: u64,
-    pub misses: u64,
-    pub batches: u64,
-    pub requested_prices: u64,
-    pub latency_ms_total: u64,
-    pub latency_samples: u64,
-    pub average_latency_ms: u64,
-}
-
-#[derive(Debug)]
-struct CacheCounters {
-    hits: AtomicU64,
-    misses: AtomicU64,
-    batches: AtomicU64,
-    requested_prices: AtomicU64,
-    latency_ms_total: AtomicU64,
-    latency_samples: AtomicU64,
-}
-
-impl Default for CacheCounters {
-    fn default() -> Self {
-        Self {
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            batches: AtomicU64::new(0),
-            requested_prices: AtomicU64::new(0),
-            latency_ms_total: AtomicU64::new(0),
-            latency_samples: AtomicU64::new(0),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct CachedPrice {
     pub price: Decimal,
@@ -127,7 +93,6 @@ pub struct PriceCache {
     ttl: Duration,
     max_retries: u32,
     circuit_breaker: Arc<JupiterCircuitBreaker>,
-    counters: Arc<CacheCounters>,
 }
 
 impl PriceCache {
@@ -137,7 +102,6 @@ impl PriceCache {
             ttl,
             max_retries: max_retries.max(1),
             circuit_breaker,
-            counters: Arc::new(CacheCounters::default()),
         }
     }
 
@@ -174,10 +138,6 @@ impl PriceCache {
             }
         }
 
-        let hits = unique.len().saturating_sub(missing.len());
-        self.counters.hits.fetch_add(hits as u64, Ordering::Relaxed);
-        self.counters.misses.fetch_add(missing.len() as u64, Ordering::Relaxed);
-
         if missing.is_empty() {
             return Ok(result);
         }
@@ -190,14 +150,9 @@ impl PriceCache {
         let mut last_error = String::from("Jupiter price request failed");
         let mut last_not_indexed = false;
         for attempt in 1..=self.max_retries {
-            let started = Instant::now();
             match fetch_prices_batch_once(http, &missing).await {
                 Ok(prices) => {
-                    self.counters.latency_ms_total.fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-                    self.counters.latency_samples.fetch_add(1, Ordering::Relaxed);
                     self.circuit_breaker.record_success();
-                    self.counters.batches.fetch_add(1, Ordering::Relaxed);
-                    self.counters.requested_prices.fetch_add(missing.len() as u64, Ordering::Relaxed);
                     {
                         let mut cache = self.cache.lock().await;
                         let now = Instant::now();
@@ -213,8 +168,6 @@ impl PriceCache {
                     return Ok(result);
                 }
                 Err(error) => {
-                    self.counters.latency_ms_total.fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-                    self.counters.latency_samples.fetch_add(1, Ordering::Relaxed);
                     last_error = error.message().to_string();
                     last_not_indexed = matches!(error, PriceFetchError::NotIndexed(_));
                     let retryable = true;
@@ -232,21 +185,6 @@ impl PriceCache {
             self.circuit_breaker.record_failure().await;
         }
         Err(last_error)
-    }
-
-    pub fn stats(&self) -> PriceCacheStats {
-        PriceCacheStats {
-            hits: self.counters.hits.load(Ordering::Relaxed),
-            misses: self.counters.misses.load(Ordering::Relaxed),
-            batches: self.counters.batches.load(Ordering::Relaxed),
-            requested_prices: self.counters.requested_prices.load(Ordering::Relaxed),
-            latency_ms_total: self.counters.latency_ms_total.load(Ordering::Relaxed),
-            latency_samples: self.counters.latency_samples.load(Ordering::Relaxed),
-            average_latency_ms: {
-                let samples = self.counters.latency_samples.load(Ordering::Relaxed);
-                if samples == 0 { 0 } else { self.counters.latency_ms_total.load(Ordering::Relaxed) / samples }
-            },
-        }
     }
 }
 
