@@ -21,6 +21,18 @@ members = [
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Pulled in directly (not just transitively via reqwest/tokio-tungstenite)
+# so the runner can explicitly install a single process-wide crypto
+# provider at startup. reqwest's `rustls-tls` and tokio-tungstenite's
+# `rustls-tls-webpki-roots` don't agree on a default backend (aws-lc-rs
+# vs ring), and having both linked in leaves rustls unable to
+# auto-select one - it panics on the first TLS handshake instead of
+# guessing. `ring` is the deliberate choice here, not aws-lc-rs: this
+# project ships an Android/Termux build (see the release workflow),
+# and aws-lc-rs needs a C/C++ toolchain (cmake, clang) to build, which
+# is a much rougher requirement on Termux than ring's prebuilt-friendly
+# pure-Rust-plus-assembly approach.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures-util = "0.3"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -74,6 +86,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rust_decimal = { workspace = true }
+rustls = { workspace = true }
 
 --- ./bin/runner/src/main.rs ---
 //! Composition root for ben_snipes. This is where concrete adapters get
@@ -110,13 +123,19 @@ use ben_snipes_adapter_pumpfun::{
     load_wallet, wallet_pubkey_string, DexScreenerMetricsProvider, NoWalletExchange,
     PumpPortalExchangeClient, PumpPortalSource, RugCheckSafetyChecker,
 };
-use ben_snipes_adapter_statefile::{FileAcquisitionLedger, FilePendingTradeStore, FilePositionStore, FileTradeStore, StatefileStore};
+use ben_snipes_adapter_statefile::{
+    FileAcquisitionLedger, FilePendingTradeStore, FilePositionStore, FileTradeStore, InstanceLock,
+    StatefileStore,
+};
 use ben_snipes_application::{AcquisitionDecision, AcquisitionEngine, NewListingDetector, PaperExchange, PositionManager, RuntimeMetrics, SafetyGate};
 use ben_snipes_config::{AppConfig, ExecutionMode};
 use ben_snipes_domain::{
     AcquisitionCriteria, ListingMetrics, PerformanceSummary, Position, ProfitTarget, SafetyCriteria, SafetyReport, TradeRecord,
 };
-use ben_snipes_ports::{AcquisitionLedger, ExchangeClient, ListingSource, PendingTradeStore, PositionStore, TradeStore};
+use ben_snipes_ports::{
+    AcquisitionLedger, ExchangeClient, ListingSource, PendingTradeStore, PositionStore,
+    SystemClock, TradeStore,
+};
 use rust_decimal::Decimal;
 use std::fmt::Display;
 use std::path::Path;
@@ -406,6 +425,54 @@ async fn build_venues(
 
 #[tokio::main]
 async fn main() {
+    // Handled before anything else - no config, no network, no wallet
+    // access - so `--version`/`--help` are instant and side-effect-free.
+    // This matters beyond convenience: install.sh's post-install self
+    // test runs `./ben_snipes --version` and relies on it actually
+    // exiting immediately. Without this, the binary ignored all CLI
+    // arguments entirely, so that line launched the *real* bot - full
+    // startup, real RPC connections, and (since install.sh has already
+    // sourced .env by that point, including a real SOLANA_PRIVATE_KEY
+    // if the user provided one) potentially real trading - and then
+    // never returned, since the main loop runs forever. That would hang
+    // every fresh install on this exact line.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("ben_snipes {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("ben_snipes {}", env!("CARGO_PKG_VERSION"));
+        println!("A Solana/EVM new-listing trading bot.");
+        println!();
+        println!("Configuration is via config/default.toml and environment");
+        println!("variables (SOLANA_PRIVATE_KEY, etc.) - not CLI flags.");
+        println!();
+        println!("USAGE:");
+        println!("    ben_snipes");
+        println!();
+        println!("OPTIONS:");
+        println!("    -V, --version    Print version and exit");
+        println!("    -h, --help       Print this help and exit");
+        return;
+    }
+
+    // Must happen before any TLS connection is attempted (reqwest calls
+    // in pumpfun/evm-onchain, websocket connects in evm-onchain). Two
+    // different rustls backend crates (ring, aws-lc-rs) are reachable
+    // through this workspace's dependency graph, and rustls refuses to
+    // guess between them - the first TLS handshake panics instead.
+    // Installing one explicitly, once, up front resolves that
+    // deterministically regardless of which adapter makes the first
+    // network call.
+    if rustls::crypto::ring::default_provider().install_default().is_err() {
+        // Only reachable if something else in-process already installed
+        // a provider first - not an error, just means we were beaten to
+        // it (e.g. under a future test harness that runs `main`'s setup
+        // more than once in the same process).
+        eprintln!("rustls crypto provider was already installed; continuing with the existing one");
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -422,6 +489,20 @@ async fn main() {
         eprintln!("invalid runtime configuration: {e}");
         std::process::exit(1);
     }
+
+    // Must happen before any other state file is touched: two processes
+    // racing on the same open-positions/trade-journal files could
+    // double-buy, double-sell, or corrupt the journal. `_instance_lock`
+    // is held for the remaining lifetime of `main` and released (lock
+    // file removed) on drop - i.e. on normal process exit.
+    let instance_lock_path = format!("{}/instance.lock", config.storage.state_dir);
+    let _instance_lock = match InstanceLock::acquire(&instance_lock_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
 
     let risk = RiskParams {
         take_profit: expect_valid_config(
@@ -467,7 +548,7 @@ async fn main() {
     };
 
     let state_store = Arc::new(StatefileStore::new(&config.storage.state_dir));
-    let detector = NewListingDetector::new(state_store);
+    let detector = NewListingDetector::new(state_store, Arc::new(SystemClock));
 
     let ledger_path = format!("{}/acquisition-ledger.json", config.storage.state_dir);
     let ledger: Arc<dyn AcquisitionLedger> = Arc::new(expect_valid_config(
@@ -2005,7 +2086,7 @@ impl ExchangeClient for EvmUniswapV2Exchange {
             execution_price: Some(execution_price),
             quote_proceeds: Some(quote_proceeds),
             fee_quote: Some(fee_quote),
-            tx_id: Some(format!("{}", receipt.transaction_hash)),
+            tx_id: Some(receipt.transaction_hash.to_string()),
         })
     }
 }
@@ -2635,7 +2716,7 @@ use crate::retry::with_retry;
 use rust_decimal::Decimal;
 use solana_sdk::signature::Signature;
 use solana_sdk::signer::keypair::Keypair;
-use solana_sdk::signer::Signer;
+use solana_sdk::signer::{SeedDerivable, Signer};
 use solana_sdk::transaction::VersionedTransaction;
 use std::env;
 
@@ -2643,20 +2724,115 @@ const TRADE_LOCAL_URL: &str = "https://pumpportal.fun/api/trade-local";
 
 /// Loads the wallet keypair from the `SOLANA_PRIVATE_KEY` environment
 /// variable. Never reads from a file this codebase writes, never logs
-/// the value (not even in error messages), and never falls back to a
-/// default - there is no safe default for a private key. Expects the
-/// base58-encoded 64-byte secret key format that `solana-keygen` and
-/// most wallet exports use.
+/// the value (not even in error messages - every error path below
+/// describes *what's wrong*, never echoes `raw` or the decoded bytes),
+/// and never falls back to a default - there is no safe default for a
+/// private key.
+///
+/// Two encodings are accepted, matching how the ecosystem actually
+/// exports keys:
+/// - base58 - what `solana-keygen` and most Solana-native wallet
+///   exports use.
+/// - hex, with or without a `0x`/`0X` prefix - what EVM-first wallets
+///   (Trust Wallet among them) export instead, frequently *without*
+///   the prefix. Detection is by content and length, not by prefix -
+///   see `decode_key_bytes` for why that's safe rather than a guess.
+///
+/// Both the 64-byte full keypair representation (32-byte secret + its
+/// matching 32-byte public key, what `solana-keygen` writes) and a
+/// bare 32-byte secret seed are accepted - some wallets export only
+/// the seed. Any other decoded length is a malformed key and fails
+/// closed rather than guessing.
+///
+/// **This function cannot detect a key from the wrong curve.** Solana
+/// uses ed25519; EVM chains use secp256k1. Any 32 bytes deterministically
+/// produce *some* valid ed25519 keypair - ed25519 has no "invalid
+/// scalar" rejection the way secp256k1 does - so an Ethereum/BNB/
+/// Polygon private key exported from a multi-chain wallet (Trust
+/// Wallet, MetaMask, etc.) will decode and construct a keypair here
+/// without error, but that keypair's Solana address has no
+/// relationship whatsoever to the EVM address the key actually
+/// controls, or to any funds the operator thinks it holds. There is no
+/// way to detect this case from the bytes alone - only the operator
+/// knows which chain's key they exported. When configuring this,
+/// confirm the wallet app was showing the *Solana* account specifically
+/// before copying its private key.
+///
+/// **Unverified until first compile** (see this file's module docs):
+/// the 32-byte path uses `solana_sdk::signer::SeedDerivable::from_seed`,
+/// confirmed present at that exact path as of solana-sdk 2.1.x's
+/// published docs, but this crate pins solana-sdk 4.x - the same
+/// Anza-fork restructuring this file already flags elsewhere means
+/// that path should be re-checked against the actual pinned version's
+/// docs.rs page before relying on it with real funds.
 pub fn load_wallet() -> Result<Keypair, String> {
     let raw = env::var("SOLANA_PRIVATE_KEY")
         .map_err(|_| "SOLANA_PRIVATE_KEY environment variable is not set".to_string())?;
 
-    let bytes = bs58::decode(raw.trim())
-        .into_vec()
-        .map_err(|e| format!("SOLANA_PRIVATE_KEY is not valid base58: {e}"))?;
+    let bytes = decode_key_bytes(raw.trim())?;
 
-    Keypair::try_from(bytes.as_slice())
-        .map_err(|e| format!("SOLANA_PRIVATE_KEY did not decode to a valid keypair: {e}"))
+    match bytes.len() {
+        64 => Keypair::try_from(bytes.as_slice())
+            .map_err(|e| format!("SOLANA_PRIVATE_KEY did not decode to a valid keypair: {e}")),
+        32 => Keypair::from_seed(&bytes)
+            .map_err(|e| format!("SOLANA_PRIVATE_KEY (32-byte seed) did not produce a valid keypair: {e}")),
+        other => Err(format!(
+            "SOLANA_PRIVATE_KEY decoded to {other} bytes; expected 32 (a secret seed) or 64 (a full keypair)"
+        )),
+    }
+}
+
+/// Decodes `raw` into raw key bytes, accepting hex (with or without a
+/// `0x`/`0X` prefix - Trust Wallet's export, among others, has no
+/// prefix) or base58 (what `solana-keygen` and most Solana-native
+/// wallet exports use), auto-detecting which one `raw` actually is.
+///
+/// The detection is content- and length-based, not prefix-based: a
+/// string made entirely of hex digits, of even length, is treated as
+/// hex. This is safe rather than a guess, for two independent reasons:
+/// - Base58's alphabet excludes '0' entirely (to avoid confusion with
+///   'O'), so any candidate containing a literal '0' cannot be valid
+///   base58 in the first place - if it's also all-hex-digit, hex is
+///   the *only* valid interpretation, not merely the likely one.
+/// - Even for candidates that avoid '0' and coincidentally sit inside
+///   hex's 16-character alphabet, length rules out any real collision:
+///   a genuine base58-encoded 32-byte key is ~44 characters and a
+///   64-byte key ~87-88, while their hex equivalents are exactly 64
+///   and 128 - the lengths this function is ever asked to decode never
+///   overlap between the two encodings.
+/// A malformed key will fail decoding either way and produce a clear
+/// error rather than silently succeeding with the wrong bytes; the
+/// byte-length check in `load_wallet` is a second, independent
+/// safety net against exactly that.
+fn decode_key_bytes(raw: &str) -> Result<Vec<u8>, String> {
+    let hex_candidate = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")).unwrap_or(raw);
+    let looks_like_hex = !hex_candidate.is_empty()
+        && hex_candidate.len() % 2 == 0
+        && hex_candidate.bytes().all(|b| b.is_ascii_hexdigit());
+
+    if looks_like_hex {
+        return decode_hex(hex_candidate);
+    }
+
+    bs58::decode(raw).into_vec().map_err(|e| {
+        format!(
+            "SOLANA_PRIVATE_KEY is neither a hex-digit string of even length \
+             (with or without a 0x prefix) nor valid base58: {e}"
+        )
+    })
+}
+
+fn decode_hex(digits: &str) -> Result<Vec<u8>, String> {
+    if digits.is_empty() || digits.len() % 2 != 0 {
+        return Err("SOLANA_PRIVATE_KEY has an odd number of hex digits after 0x".to_string());
+    }
+    (0..digits.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&digits[i..i + 2], 16)
+                .map_err(|_| "SOLANA_PRIVATE_KEY contains a non-hex character after 0x".to_string())
+        })
+        .collect()
 }
 
 /// Convenience for callers that just want to log/display the wallet's
@@ -2916,6 +3092,74 @@ async fn broadcast(http: &reqwest::Client, rpc_url: &str, signed_bytes: &[u8]) -
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| format!("RPC response had no result field: {response_json}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_base58_without_a_prefix() {
+        let bytes = decode_key_bytes(&bs58::encode([7u8; 32]).into_string()).expect("valid base58 should decode");
+        assert_eq!(bytes, vec![7u8; 32]);
+    }
+
+    #[test]
+    fn decodes_0x_prefixed_hex() {
+        let hex_str = format!("0x{}", "ab".repeat(32));
+        let bytes = decode_key_bytes(&hex_str).expect("valid 0x-prefixed hex should decode");
+        assert_eq!(bytes, vec![0xabu8; 32]);
+    }
+
+    #[test]
+    fn rejects_odd_length_hex() {
+        let result = decode_key_bytes("0xabc");
+        assert!(result.is_err(), "an odd number of hex digits is malformed and must not silently truncate");
+    }
+
+    #[test]
+    fn rejects_non_hex_characters_after_0x_prefix() {
+        let result = decode_key_bytes("0xzzzz");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decodes_hex_without_a_0x_prefix() {
+        // The exact case that motivated this: Trust Wallet's private
+        // key export has no 0x prefix.
+        let bytes = decode_key_bytes(&"ab".repeat(32)).expect("bare hex should decode");
+        assert_eq!(bytes, vec![0xabu8; 32]);
+    }
+
+    #[test]
+    fn rejects_a_string_that_is_neither_valid_hex_nor_valid_base58() {
+        // '0', 'O', 'I', 'l' are all excluded from the base58 alphabet,
+        // and this isn't all-hex-digit either.
+        let result = decode_key_bytes("0OIl-not-a-real-key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn base58_containing_a_literal_zero_is_never_misread_as_hex() {
+        // '0' is excluded from base58's alphabet specifically to avoid
+        // confusion with 'O', so a string containing '0' can only ever
+        // be intended as hex, never base58 - this pins down that the
+        // detection doesn't get that backwards.
+        let hex_str = "0".repeat(64);
+        let bytes = decode_key_bytes(&hex_str).expect("all-zero hex should decode");
+        assert_eq!(bytes, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn a_genuine_base58_key_is_not_misdetected_as_hex() {
+        // A real base58-encoded 32-byte key is ~44 characters, not the
+        // 64 hex-digit-and-even-length shape decode_key_bytes looks
+        // for, so it must fall through to the base58 path uncorrupted.
+        let original = [7u8; 32];
+        let encoded = bs58::encode(original).into_string();
+        let decoded = decode_key_bytes(&encoded).expect("valid base58 should decode");
+        assert_eq!(decoded, original.to_vec());
+    }
 }
 
 --- ./crates/adapters/pumpfun/src/lib.rs ---
@@ -3943,9 +4187,11 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tracing::debug;
 
+mod instance_lock;
 mod ledger;
 mod position_store;
 mod trade_store;
+pub use instance_lock::InstanceLock;
 pub use ledger::FileAcquisitionLedger;
 pub use position_store::FilePositionStore;
 pub use trade_store::{FilePendingTradeStore, FileTradeStore};
@@ -4361,6 +4607,180 @@ impl PendingTradeStore for FilePendingTradeStore {
             .await
             .map_err(|e| PortError::Storage(Box::new(e)))?;
         Ok(())
+    }
+}
+
+--- ./crates/adapters/statefile/src/instance_lock.rs ---
+//! A PID-file lock preventing two `ben_snipes` processes from trading
+//! against the same state directory concurrently. Two instances racing
+//! on the same `open-positions.json`/`trades.json` could double-buy,
+//! double-sell, or corrupt the trade journal, so this is checked before
+//! any other state file is touched.
+//!
+//! Liveness is checked via the `/proc/<pid>` filesystem, which exists
+//! on every target this project ships to (Linux, and Android/Termux -
+//! also a Linux kernel - per the release workflow). That keeps this
+//! dependency-free rather than pulling in an OS-locking crate for a
+//! single check. A lock file whose recorded PID no longer corresponds
+//! to a running process is stale - the previous process crashed,
+//! was killed, or the machine lost power - and is silently reclaimed
+//! rather than permanently blocking every future startup.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// Held for the lifetime of the process. Dropping it deletes the lock
+/// file so the next start doesn't have to wait for stale-PID detection.
+/// A path that skips `Drop` - `std::process::exit` called while the
+/// lock is still held, or a hard kill - leaves the file behind naming
+/// a now-dead PID, which the next `acquire` reclaims automatically via
+/// the same staleness check used for a crash. No caller bookkeeping
+/// required either way.
+pub struct InstanceLock {
+    path: PathBuf,
+}
+
+impl InstanceLock {
+    /// Acquires the lock at `path`, refusing to start if another live
+    /// process already holds it.
+    pub fn acquire(path: impl Into<PathBuf>) -> Result<Self, String> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create directory for instance lock: {e}"))?;
+            }
+        }
+
+        if let Some(existing_pid) = Self::read_pid(&path)? {
+            if Self::process_is_alive(existing_pid) {
+                return Err(format!(
+                    "another ben_snipes instance appears to be running (pid {existing_pid}, lock file: {})",
+                    path.display()
+                ));
+            }
+            // The recorded process is gone: a crash, `kill -9`, or a
+            // power loss left this behind. Fall through and reclaim it.
+        }
+
+        let pid = std::process::id();
+        let tmp_path = path.with_extension("lock.tmp");
+        {
+            let mut file = std::fs::File::create(&tmp_path)
+                .map_err(|e| format!("failed to write instance lock: {e}"))?;
+            write!(file, "{pid}").map_err(|e| format!("failed to write instance lock: {e}"))?;
+        }
+        std::fs::rename(&tmp_path, &path).map_err(|e| format!("failed to write instance lock: {e}"))?;
+
+        Ok(Self { path })
+    }
+
+    /// `Ok(None)` covers both "no lock file yet" and "the lock file
+    /// exists but its contents aren't a readable PID" - either way
+    /// there's no evidence of a live owner, and refusing to start over
+    /// an unreadable-but-harmless file would be worse than reclaiming it.
+    fn read_pid(path: &Path) -> Result<Option<u32>, String> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => Ok(contents.trim().parse::<u32>().ok()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("failed to read instance lock: {e}")),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_alive(pid: u32) -> bool {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// Off Linux there's no dependency-free way to check this. Fail
+    /// closed - assume the process might still be alive - rather than
+    /// risk two instances trading concurrently on a platform this
+    /// project doesn't target anyway.
+    #[cfg(not(target_os = "linux"))]
+    fn process_is_alive(_pid: u32) -> bool {
+        true
+    }
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path() -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should never be before the epoch in CI")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ben_snipes-instance-test-{nanos}.lock"))
+    }
+
+    #[test]
+    fn acquires_a_fresh_lock_and_removes_it_on_drop() {
+        let path = temp_path();
+        let lock = InstanceLock::acquire(&path).expect("fresh lock should acquire");
+        assert!(path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("lock file should be readable").trim(),
+            std::process::id().to_string()
+        );
+
+        drop(lock);
+        assert!(!path.exists(), "dropping the lock should remove the file");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refuses_to_acquire_while_the_recorded_process_is_alive() {
+        let path = temp_path();
+        std::fs::write(&path, std::process::id().to_string()).expect("test setup should succeed");
+
+        let result = InstanceLock::acquire(&path);
+        assert!(result.is_err(), "a lock file naming this live process should block a second acquire");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reclaims_a_lock_left_by_a_dead_process() {
+        let path = temp_path();
+        // Far outside any realistic process table (Linux's pid_max
+        // tops out well below this even at its highest configurable
+        // setting), so /proc/<pid> is guaranteed not to exist without
+        // depending on which specific PIDs happen to be free right now.
+        std::fs::write(&path, "999999999").expect("test setup should succeed");
+
+        let lock = InstanceLock::acquire(&path).expect("a lock naming a dead process should be reclaimed");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("lock file should be readable").trim(),
+            std::process::id().to_string()
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn a_corrupted_lock_file_does_not_permanently_block_startup() {
+        let path = temp_path();
+        std::fs::write(&path, "not-a-pid").expect("test setup should succeed");
+
+        let lock = InstanceLock::acquire(&path);
+        assert!(lock.is_ok(), "an unreadable lock file should not permanently block startup");
+        drop(lock);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_lock_file_acquires_cleanly() {
+        let path = temp_path();
+        let lock = InstanceLock::acquire(&path);
+        assert!(lock.is_ok());
     }
 }
 
@@ -4894,7 +5314,8 @@ pub use runtime_metrics::RuntimeMetrics;
 --- ./crates/application/src/new_listing_detector.rs ---
 use ben_snipes_domain::Listing;
 use ben_snipes_ports::{
-    KnownListings, ListingSnapshot, ListingSource, ListingStateStore, PendingListing, PortError,
+    Clock, KnownListings, ListingSnapshot, ListingSource, ListingStateStore, PendingListing,
+    PortError,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -4938,11 +5359,12 @@ fn prune_expired_pending(known: &mut KnownListings, now: OffsetDateTime) {
 
 pub struct NewListingDetector {
     state_store: Arc<dyn ListingStateStore>,
+    clock: Arc<dyn Clock>,
 }
 
 impl NewListingDetector {
-    pub fn new(state_store: Arc<dyn ListingStateStore>) -> Self {
-        Self { state_store }
+    pub fn new(state_store: Arc<dyn ListingStateStore>, clock: Arc<dyn Clock>) -> Self {
+        Self { state_store, clock }
     }
 
     pub async fn poll(
@@ -4962,7 +5384,7 @@ impl NewListingDetector {
                     let key = listing.dedupe_key();
                     known.seen_keys.insert(key.clone());
                     known.pending.entry(key).or_insert_with(|| {
-                        PendingListing::new(listing.clone(), OffsetDateTime::now_utc())
+                        PendingListing::new(listing.clone(), self.clock.now())
                     });
                 }
                 known.cursor = cursor;
@@ -4990,14 +5412,14 @@ impl NewListingDetector {
                     let key = listing.dedupe_key();
                     known.seen_keys.insert(key.clone());
                     known.pending.entry(key).or_insert_with(|| {
-                        PendingListing::new(listing.clone(), OffsetDateTime::now_utc())
+                        PendingListing::new(listing.clone(), self.clock.now())
                     });
                 }
                 fresh
             }
         };
 
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now();
         prune_expired_pending(&mut known, now);
 
         if retry_pending {
@@ -5049,7 +5471,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use ben_snipes_domain::{Chain, Symbol, Venue, VenueKind};
-    use ben_snipes_ports::KnownListings;
+    use ben_snipes_ports::{KnownListings, SystemClock};
     use std::sync::Mutex;
     use time::OffsetDateTime;
 
@@ -5112,7 +5534,7 @@ mod tests {
     #[tokio::test]
     async fn first_poll_establishes_baseline_and_reports_nothing_new() {
         let store = Arc::new(InMemoryStateStore::empty());
-        let detector = NewListingDetector::new(store);
+        let detector = NewListingDetector::new(store, Arc::new(SystemClock));
         let source = FixedFullSnapshotSource {
             listings: vec![listing("AAAUSDT"), listing("BBBUSDT")],
         };
@@ -5127,7 +5549,7 @@ mod tests {
     #[tokio::test]
     async fn second_poll_with_same_snapshot_returns_nothing_new() {
         let store = Arc::new(InMemoryStateStore::empty());
-        let detector = NewListingDetector::new(store);
+        let detector = NewListingDetector::new(store, Arc::new(SystemClock));
         let source = FixedFullSnapshotSource {
             listings: vec![listing("AAAUSDT")],
         };
@@ -5142,7 +5564,7 @@ mod tests {
     #[tokio::test]
     async fn diff_only_surfaces_the_genuinely_new_symbol_after_baseline() {
         let store = Arc::new(InMemoryStateStore::empty());
-        let detector = NewListingDetector::new(store);
+        let detector = NewListingDetector::new(store, Arc::new(SystemClock));
 
         let first_source = FixedFullSnapshotSource {
             listings: vec![listing("AAAUSDT")],
@@ -5167,7 +5589,7 @@ mod tests {
     #[tokio::test]
     async fn pending_listing_is_retried_without_becoming_a_new_listing_again() {
         let store = Arc::new(InMemoryStateStore::empty());
-        let detector = NewListingDetector::new(store);
+        let detector = NewListingDetector::new(store, Arc::new(SystemClock));
         let source = FixedFullSnapshotSource {
             listings: vec![listing("PENDING")],
         };
@@ -5986,21 +6408,16 @@ pub enum ConfigError {
     Load(#[from] config::ConfigError),
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionMode {
     /// Detection and real execution when wallets are configured.
+    #[default]
     Live,
     /// Run the complete strategy with real market data but simulate orders.
     Paper,
     /// Detect and evaluate listings, but never attempt acquisition or exits.
     DetectionOnly,
-}
-
-impl Default for ExecutionMode {
-    fn default() -> Self {
-        Self::Live
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -7482,7 +7899,7 @@ mod token_safety_checker;
 mod trade_store;
 
 pub use acquisition_ledger::AcquisitionLedger;
-pub use clock::Clock;
+pub use clock::{Clock, SystemClock};
 pub use error::PortError;
 pub use exchange_client::ExchangeClient;
 pub use listing_source::{ListingSnapshot, ListingSource};

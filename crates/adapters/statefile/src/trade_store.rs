@@ -61,6 +61,49 @@ impl TradeStore for FileTradeStore {
     }
 }
 
+pub struct FilePendingTradeStore {
+    path: PathBuf,
+}
+
+impl FilePendingTradeStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+#[async_trait]
+impl PendingTradeStore for FilePendingTradeStore {
+    async fn load(&self) -> Result<Vec<TradeRecord>, PortError> {
+        let raw = match fs::read_to_string(&self.path).await {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(PortError::Storage(Box::new(e))),
+        };
+        serde_json::from_str(&raw).map_err(|e| PortError::MalformedResponse {
+            venue: "pending-trade-store".to_string(),
+            reason: e.to_string(),
+        })
+    }
+
+    async fn save(&self, trades: &[TradeRecord]) -> Result<(), PortError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| PortError::Storage(Box::new(e)))?;
+        }
+        let tmp_path = self.path.with_extension("json.tmp");
+        let serialised = serde_json::to_vec_pretty(trades)
+            .map_err(|e| PortError::Storage(Box::new(e)))?;
+        fs::write(&tmp_path, serialised)
+            .await
+            .map_err(|e| PortError::Storage(Box::new(e)))?;
+        fs::rename(&tmp_path, &self.path)
+            .await
+            .map_err(|e| PortError::Storage(Box::new(e)))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,49 +151,5 @@ mod tests {
         assert_eq!(loaded, vec![trade]);
 
         let _ = std::fs::remove_file(path);
-    }
-}
-
-
-pub struct FilePendingTradeStore {
-    path: PathBuf,
-}
-
-impl FilePendingTradeStore {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-}
-
-#[async_trait]
-impl PendingTradeStore for FilePendingTradeStore {
-    async fn load(&self) -> Result<Vec<TradeRecord>, PortError> {
-        let raw = match fs::read_to_string(&self.path).await {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(PortError::Storage(Box::new(e))),
-        };
-        serde_json::from_str(&raw).map_err(|e| PortError::MalformedResponse {
-            venue: "pending-trade-store".to_string(),
-            reason: e.to_string(),
-        })
-    }
-
-    async fn save(&self, trades: &[TradeRecord]) -> Result<(), PortError> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| PortError::Storage(Box::new(e)))?;
-        }
-        let tmp_path = self.path.with_extension("json.tmp");
-        let serialised = serde_json::to_vec_pretty(trades)
-            .map_err(|e| PortError::Storage(Box::new(e)))?;
-        fs::write(&tmp_path, serialised)
-            .await
-            .map_err(|e| PortError::Storage(Box::new(e)))?;
-        fs::rename(&tmp_path, &self.path)
-            .await
-            .map_err(|e| PortError::Storage(Box::new(e)))?;
-        Ok(())
     }
 }
