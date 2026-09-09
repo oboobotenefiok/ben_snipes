@@ -163,7 +163,7 @@ impl PumpPortalExchangeClient {
     /// balance figure) and falls back to the float `uiAmount` field only
     /// if the string form isn't present.
     async fn token_balance(&self, mint: &str) -> Result<Decimal, PortError> {
-        let wallet_pubkey = self.wallet()?.pubkey().to_string();
+        let wallet_pubkey = self.wallet().pubkey().to_string();
         with_retry(3, || async {
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -214,7 +214,7 @@ impl PumpPortalExchangeClient {
     /// SOL balance of the wallet, in whole SOL (not lamports) - used for
     /// the pre-trade balance check in `submit_buy_by_amount`.
     async fn sol_balance(&self) -> Result<Decimal, PortError> {
-        let wallet_pubkey = self.wallet()?.pubkey().to_string();
+        let wallet_pubkey = self.wallet().pubkey().to_string();
         with_retry(3, || async {
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -260,7 +260,7 @@ impl PumpPortalExchangeClient {
     /// transaction fee, while the fee is returned separately. This avoids
     /// treating a pre-trade price quote as a fill.
     async fn solana_settlement(&self, signature: &str) -> Result<(Decimal, Decimal), PortError> {
-        let wallet_pubkey = self.wallet()?.pubkey().to_string();
+        let wallet_pubkey = self.wallet().pubkey().to_string();
         with_retry(3, || async {
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -422,7 +422,7 @@ impl ExchangeClient for PumpPortalExchangeClient {
             priority_fee_sol: self.priority_fee_sol,
         };
 
-        let signature = execute_trade(&self.http, self.wallet()?, &self.rpc_url, &request)
+        let signature = execute_trade(&self.http, self.wallet(), &self.rpc_url, &request)
             .await
             .map_err(PortError::Rejected)?;
 
@@ -462,7 +462,7 @@ impl ExchangeClient for PumpPortalExchangeClient {
             priority_fee_sol: self.priority_fee_sol,
         };
 
-        preflight_trade(&self.http, self.wallet()?, &self.rpc_url, &request)
+        preflight_trade(&self.http, self.wallet(), &self.rpc_url, &request)
             .await
             .map_err(PortError::Rejected)
     }
@@ -484,7 +484,7 @@ impl ExchangeClient for PumpPortalExchangeClient {
 
         let previous_quantity = self.token_balance(order.symbol.as_str()).await?;
 
-        let signature = execute_trade(&self.http, self.wallet()?, &self.rpc_url, &request)
+        let signature = execute_trade(&self.http, self.wallet(), &self.rpc_url, &request)
             .await
             .map_err(PortError::Rejected)?;
 
