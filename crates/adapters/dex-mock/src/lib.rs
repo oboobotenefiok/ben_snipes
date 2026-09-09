@@ -12,11 +12,11 @@
 
 use async_trait::async_trait;
 use ben_snipes_domain::{
-    Chain, FilledBuy, FilledSell, Listing, ListingMetrics, Order, SafetyReport, Symbol, Venue,
+    Chain, FilledBuy, FilledSell, Listing, ListingMetrics, Order, Symbol, Venue,
     VenueKind,
 };
 use ben_snipes_ports::{
-    ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError, TokenSafetyChecker,
+    ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError,
 };
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -95,7 +95,6 @@ pub struct MockDexClient {
     venue_name: String,
     price: Mutex<Decimal>,
     metrics: Mutex<HashMap<String, ListingMetrics>>,
-    safety_reports: Mutex<HashMap<String, SafetyReport>>,
 }
 
 impl MockDexClient {
@@ -104,7 +103,6 @@ impl MockDexClient {
             venue_name: venue_name.into(),
             price: Mutex::new(starting_price),
             metrics: Mutex::new(HashMap::new()),
-            safety_reports: Mutex::new(HashMap::new()),
         }
     }
 
@@ -119,13 +117,6 @@ impl MockDexClient {
         self.metrics.lock().await.insert(symbol.into(), metrics);
     }
 
-    /// Seeds a honeypot/rug safety report for a symbol. A real adapter
-    /// would get this by simulating a sell against the token contract
-    /// and inspecting ownership/liquidity-lock state on-chain, rather
-    /// than a hand-set map.
-    pub async fn set_safety_report(&self, symbol: impl Into<String>, report: SafetyReport) {
-        self.safety_reports.lock().await.insert(symbol.into(), report);
-    }
 }
 
 #[async_trait]
@@ -168,12 +159,6 @@ impl MetricsProvider for MockDexClient {
     }
 }
 
-#[async_trait]
-impl TokenSafetyChecker for MockDexClient {
-    async fn assess(&self, symbol: &Symbol) -> Result<Option<SafetyReport>, PortError> {
-        Ok(self.safety_reports.lock().await.get(symbol.as_str()).copied())
-    }
-}
 
 #[cfg(test)]
 mod tests {

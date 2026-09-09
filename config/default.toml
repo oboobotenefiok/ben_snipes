@@ -10,7 +10,7 @@ take_profit_percent = "10.0"
 poll_interval_seconds = 5
 # A newly detected token can exist on-chain before DexScreener indexes it, or
 # can be indexed before it has enough volume to qualify. Keep it in the
-# persistent pending cursor and retry the metrics/safety lookup every 20
+# persistent pending cursor and retry the metrics lookup every 20
 # seconds for 24 hours. A temporary low-volume result is not a rejection.
 pending_listing_retry_seconds = 20
 # This is the real SOL amount spent per buy on the live Solana venue
@@ -21,27 +21,15 @@ pending_listing_retry_seconds = 20
 max_position_size = "0.01"
 # "Active volume" is meant as the smallest threshold that's still
 # meaningful, not a high bar - the goal is catching a listing early,
-# not waiting until it's already proven itself. 250 (USD-equivalent,
-# per DexScreener's 24h volume figure) is a judgment call, not a
-# researched-optimal number: low enough to catch a token within its
-# first few minutes if it's getting any real secondary trading beyond
-# the creator's initial buy, high enough to filter out pure noise/a
-# single small trade. Tune this if you have better intuition for where
-# that line sits.
-min_volume_24h = "250"
+# not waiting until it's already proven itself. 1 USD-equivalent is intentionally the minimum threshold: any
+# measurable 24h activity qualifies. The goal is to catch listings as
+# early as possible rather than wait for substantial volume.
+min_volume_24h = "1"
 max_open_positions = 3
 max_consecutive_failures = 5
 max_new_listings_per_cycle = 20
 entry_kill_switch_file = "state/STOP_ENTRIES"
 
-[safety]
-# 1000 bps = 10%. Anything taxing a sell higher than this is treated as
-# a honeypot signal rather than an aggressive-but-legitimate tokenomics
-# choice - tune down if that's too permissive for your risk tolerance.
-max_sell_tax_bps = 1000
-# Token-2022 transfer fees are separate from DEX/router sell taxes.
-# Keep this at zero unless a non-zero token transfer fee is explicitly acceptable.
-max_token_transfer_fee_bps = 0
 
 [storage]
 state_dir = "state"

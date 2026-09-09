@@ -1,38 +1,19 @@
 use ben_snipes_domain::{
-    AcquisitionCriteria, CanonicalTokenId, Listing, Position, ProfitTarget, SafetyCriteria,
+    AcquisitionCriteria, CanonicalTokenId, Listing, Position, ProfitTarget,
 };
 use ben_snipes_ports::{
-    AcquisitionLedger, ExchangeClient, MetricsProvider, PortError, TokenSafetyChecker,
+    AcquisitionLedger, ExchangeClient, MetricsProvider, PortError,
 };
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
-
-/// Bundles a `TokenSafetyChecker` with the `SafetyCriteria` it's judged
-/// against. Kept as its own type (rather than two loose fields on
-/// `AcquisitionEngine`) so the two can never be set independently of
-/// each other - a checker with no criteria, or criteria with no
-/// checker, isn't a state that should be representable.
-///
-/// Only construct this for venues where it's meaningful. A CEX venue
-/// generally shouldn't have one at all - see the README.
-pub struct SafetyGate {
-    checker: Arc<dyn TokenSafetyChecker>,
-    criteria: SafetyCriteria,
-}
-
-impl SafetyGate {
-    pub fn new(checker: Arc<dyn TokenSafetyChecker>, criteria: SafetyCriteria) -> Self {
-        Self { checker, criteria }
-    }
-}
 
 /// Turns a detected `Listing` into an open `Position`, autonomously,
 /// with no human in the loop.
 ///
 /// The decision flow is deliberately linear and each step can bail out
 /// cleanly with `Ok(None)`: no metrics yet, doesn't meet criteria, fails
-/// the safety gate, or already reserved by another source, are all
+/// the acquisition gate, or already reserved by another source, are all
 /// expected outcomes, not failures - only genuine I/O errors come back
 /// as `Err`. The `AcquisitionLedger` reservation happens last, right
 /// before the buy, so a token only ever consumes a ledger slot once it's
@@ -54,7 +35,6 @@ pub struct AcquisitionEngine {
     /// This is the single number that caps how much a single bad
     /// listing can cost - see the README for why this isn't optional.
     position_size: Decimal,
-    safety_gate: Option<SafetyGate>,
 }
 
 impl AcquisitionEngine {
@@ -66,7 +46,6 @@ impl AcquisitionEngine {
         criteria: AcquisitionCriteria,
         take_profit: ProfitTarget,
         position_size: Decimal,
-        safety_gate: Option<SafetyGate>,
     ) -> Self {
         Self {
             metrics_provider,
@@ -75,16 +54,13 @@ impl AcquisitionEngine {
             criteria,
             take_profit,
             position_size,
-            safety_gate,
         }
     }
 
     /// Evaluates a freshly-detected listing and, if it qualifies, buys
-    /// it. `Pending` means an external indexer or safety provider has not
-    /// exposed enough information yet, or the current metrics do not meet
-    /// the acquisition threshold yet. `Rejected` is reserved for a
-    /// definitive decision such as a failed safety gate or an existing
-    /// acquisition reservation.
+    /// `Pending` means metrics are not yet available or the listing does not
+    /// currently meet the acquisition threshold. `Rejected` is reserved for
+    /// a definitive decision such as an existing acquisition reservation.
     pub async fn evaluate_and_buy(&self, listing: &Listing) -> Result<AcquisitionDecision, PortError> {
         let Some(metrics) = self.metrics_provider.metrics(&listing.symbol).await? else {
             debug!(symbol = listing.symbol.as_str(), "no metrics yet, skipping");
@@ -98,28 +74,6 @@ impl AcquisitionEngine {
                 "does not meet acquisition criteria yet; retaining for pending retry"
             );
             return Ok(AcquisitionDecision::Pending);
-        }
-
-        if let Some(gate) = &self.safety_gate {
-            let Some(report) = gate.checker.assess(&listing.symbol).await? else {
-                debug!(symbol = listing.symbol.as_str(), "no safety assessment yet, skipping");
-                return Ok(AcquisitionDecision::Pending);
-            };
-
-            if !gate.criteria.passes(&report) {
-                info!(
-                    symbol = listing.symbol.as_str(),
-                    sell_tax_bps = ?report.sell_tax_bps,
-                    token_transfer_fee_bps = ?report.token_transfer_fee_bps,
-                    sellability = ?report.sellability,
-                    has_permanent_delegate = report.has_permanent_delegate,
-                    ownership_renounced = report.ownership_renounced,
-                    liquidity_locked = report.liquidity_locked,
-                    is_mintable = report.is_mintable,
-                    "failed safety check, skipping (likely honeypot/rug signal)"
-                );
-                return Ok(AcquisitionDecision::Rejected);
-            }
         }
 
         // Everything else passed - this is the point where two sources
@@ -180,7 +134,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use ben_snipes_domain::{
-        Chain, FilledBuy, FilledSell, ListingMetrics, Order, SafetyReport, Symbol, Venue, VenueKind,
+        Chain, FilledBuy, FilledSell, ListingMetrics, Order, Symbol, Venue, VenueKind,
     };
     use std::collections::HashSet;
     use time::OffsetDateTime;
@@ -197,16 +151,6 @@ mod tests {
         }
     }
 
-    struct StubSafetyChecker {
-        report: Option<SafetyReport>,
-    }
-
-    #[async_trait]
-    impl TokenSafetyChecker for StubSafetyChecker {
-        async fn assess(&self, _symbol: &Symbol) -> Result<Option<SafetyReport>, PortError> {
-            Ok(self.report)
-        }
-    }
 
     struct StubExchange {
         buys_submitted: Mutex<u32>,
@@ -289,7 +233,6 @@ mod tests {
 
     fn build_engine(
         metrics: Option<ListingMetrics>,
-        safety_gate: Option<SafetyGate>,
         exchange: Arc<StubExchange>,
         ledger: Arc<dyn AcquisitionLedger>,
     ) -> AcquisitionEngine {
@@ -297,20 +240,19 @@ mod tests {
             Arc::new(StubMetricsProvider { report: metrics }),
             exchange,
             ledger,
-            AcquisitionCriteria::new(Decimal::from(50_000)).expect("literal criteria is valid"),
+            AcquisitionCriteria::new(Decimal::ONE).expect("literal criteria is valid"),
             ProfitTarget::from_percent(Decimal::TEN).expect("valid target"),
             Decimal::from(25),
-            safety_gate,
         )
     }
 
     #[tokio::test]
-    async fn buys_when_no_safety_gate_configured() {
+    async fn buys_when_volume_meets_the_threshold() {
         let exchange = Arc::new(StubExchange {
             buys_submitted: Mutex::new(0),
             fail_buy: false,
         });
-        let engine = build_engine(Some(passing_metrics()), None, exchange.clone(), Arc::new(InMemoryLedger::empty()));
+        let engine = build_engine(Some(passing_metrics()), exchange.clone(), Arc::new(InMemoryLedger::empty()));
 
         let result = engine
             .evaluate_and_buy(&sample_listing())
@@ -328,12 +270,11 @@ mod tests {
             fail_buy: false,
         });
         let metrics = ListingMetrics {
-            volume_24h: Decimal::from(10),
+            volume_24h: Decimal::ZERO,
             market_cap: Decimal::from(100_000),
         };
         let engine = build_engine(
             Some(metrics),
-            None,
             exchange.clone(),
             Arc::new(InMemoryLedger::empty()),
         );
@@ -347,35 +288,6 @@ mod tests {
         assert_eq!(*exchange.buys_submitted.lock().await, 0);
     }
 
-    #[tokio::test]
-    async fn skips_a_listing_that_fails_the_safety_gate() {
-        let exchange = Arc::new(StubExchange {
-            buys_submitted: Mutex::new(0),
-            fail_buy: false,
-        });
-        let dangerous_report = SafetyReport {
-            sell_tax_bps: Some(9_000),
-            token_transfer_fee_bps: Some(0),
-            sellability: ben_snipes_domain::SellabilityEvidence::Simulated,
-            has_permanent_delegate: false,
-            ownership_renounced: false,
-            liquidity_locked: false,
-            is_mintable: true,
-        };
-        let gate = SafetyGate::new(
-            Arc::new(StubSafetyChecker { report: Some(dangerous_report) }),
-            SafetyCriteria::new(1_000, 0),
-        );
-        let engine = build_engine(Some(passing_metrics()), Some(gate), exchange.clone(), Arc::new(InMemoryLedger::empty()));
-
-        let result = engine
-            .evaluate_and_buy(&sample_listing())
-            .await
-            .expect("stub dependencies cannot fail");
-
-        assert!(matches!(result, AcquisitionDecision::Rejected));
-        assert_eq!(*exchange.buys_submitted.lock().await, 0);
-    }
 
     #[tokio::test]
     async fn second_source_reporting_the_same_token_is_skipped_via_the_ledger() {
@@ -385,8 +297,8 @@ mod tests {
         });
         let ledger: Arc<dyn AcquisitionLedger> = Arc::new(InMemoryLedger::empty());
 
-        let engine_a = build_engine(Some(passing_metrics()), None, exchange.clone(), ledger.clone());
-        let engine_b = build_engine(Some(passing_metrics()), None, exchange.clone(), ledger.clone());
+        let engine_a = build_engine(Some(passing_metrics()), exchange.clone(), ledger.clone());
+        let engine_b = build_engine(Some(passing_metrics()), exchange.clone(), ledger.clone());
 
         // Two different "sources" (engines) reporting the exact same
         // canonical token (same chain + symbol) - only the first buy
@@ -412,7 +324,7 @@ mod tests {
             fail_buy: true,
         });
         let ledger: Arc<dyn AcquisitionLedger> = Arc::new(InMemoryLedger::empty());
-        let engine = build_engine(Some(passing_metrics()), None, exchange.clone(), ledger.clone());
+        let engine = build_engine(Some(passing_metrics()), exchange.clone(), ledger.clone());
 
         let result = engine.evaluate_and_buy(&sample_listing()).await;
         assert!(result.is_err());

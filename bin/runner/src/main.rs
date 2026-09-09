@@ -10,13 +10,12 @@
 //! `ben_snipes-adapter-evm-onchain`).
 //!
 //! **The Solana pipeline is now fully wired end to end**: real
-//! detection, real volume filtering (DexScreener), a real safety gate
-//! (RugCheck), a real cross-source dedup ledger, and - if
+//! detection, real volume filtering (DexScreener), a real cross-source
+//! dedup ledger, and - if
 //! `SOLANA_PRIVATE_KEY` is set - real buy/sell execution. That means
 //! this can autonomously spend real funds the moment a wallet is
 //! configured. Every piece added this way carries its own confidence
-//! caveat in its module docs (`execution.rs` for signing, `safety_checker.rs`
-//! for RugCheck's field-mapping risk, `price_feed.rs` for the
+//! caveat in its module docs (`execution.rs` for signing, `price_feed.rs` for the
 //! SOL-denomination fix) - read them before funding a wallet, not after.
 //! EVM execution is wired through Alloy and an optional private RPC. A
 //! `dex-mock` demo venue is available in paper mode so `cargo run` can
@@ -26,20 +25,20 @@
 use ben_snipes_adapter_dex_mock::{MockDexClient, MockDexSource};
 use ben_snipes_adapter_evm_onchain::{
     DexScreenerEvmMetrics, EvmFactoryConfig, EvmFactoryLogSource, EvmUniswapV2Exchange,
-    HoneypotEvmSafetyChecker, NoWalletEvmExchange,
+    NoWalletEvmExchange,
 };
 use ben_snipes_adapter_pumpfun::{
     load_wallet, wallet_pubkey_string, DexScreenerMetricsProvider, NoWalletExchange,
-    PumpPortalExchangeClient, PumpPortalSource, RugCheckSafetyChecker,
+    PumpPortalExchangeClient, PumpPortalSource,
 };
 use ben_snipes_adapter_statefile::{
     FileAcquisitionLedger, FilePendingTradeStore, FilePositionStore, FileTradeStore, InstanceLock,
     StatefileStore,
 };
-use ben_snipes_application::{AcquisitionDecision, AcquisitionEngine, NewListingDetector, PaperExchange, PositionManager, RuntimeMetrics, SafetyGate};
+use ben_snipes_application::{AcquisitionDecision, AcquisitionEngine, NewListingDetector, PaperExchange, PositionManager, RuntimeMetrics};
 use ben_snipes_config::{AppConfig, ExecutionMode};
 use ben_snipes_domain::{
-    AcquisitionCriteria, ListingMetrics, PerformanceSummary, Position, ProfitTarget, SafetyCriteria, SafetyReport, TradeRecord,
+    AcquisitionCriteria, ListingMetrics, PerformanceSummary, Position, ProfitTarget, TradeRecord,
 };
 use ben_snipes_ports::{
     AcquisitionLedger, ExchangeClient, ListingSource, PendingTradeStore, PositionStore,
@@ -78,7 +77,6 @@ fn expect_valid_config<T, E: Display>(result: Result<T, E>, what: &str) -> T {
 struct RiskParams {
     take_profit: ProfitTarget,
     criteria: AcquisitionCriteria,
-    safety_criteria: SafetyCriteria,
 }
 
 
@@ -177,23 +175,8 @@ async fn build_venues(
                 },
             )
             .await;
-        dex_client
-            .set_safety_report(
-                "NEWCOIN-SOL",
-                SafetyReport {
-                    sell_tax_bps: Some(150),
-                    token_transfer_fee_bps: Some(0),
-                    sellability: ben_snipes_domain::SellabilityEvidence::Simulated,
-                    has_permanent_delegate: false,
-                    ownership_renounced: true,
-                    liquidity_locked: true,
-                    is_mintable: false,
-                },
-            )
-            .await;
         dex_source.simulate_new_pool("NEWCOIN-SOL").await;
 
-        let demo_safety_gate = SafetyGate::new(dex_client.clone(), risk.safety_criteria);
         let demo_exchange: Arc<dyn ExchangeClient> = Arc::new(PaperExchange::new(dex_client.clone()));
         venues.push(VenueHandle {
             acquisition: AcquisitionEngine::new(
@@ -203,7 +186,6 @@ async fn build_venues(
                 risk.criteria,
                 risk.take_profit,
                 config.risk.max_position_size,
-                Some(demo_safety_gate),
             ),
             position_manager: PositionManager::new(demo_exchange),
             source: Box::new(dex_source),
@@ -239,7 +221,6 @@ async fn build_venues(
     };
 
     let solana_metrics = Arc::new(DexScreenerMetricsProvider::new());
-    let solana_safety_gate = SafetyGate::new(Arc::new(RugCheckSafetyChecker::new()), risk.safety_criteria);
 
     venues.push(VenueHandle {
         acquisition: AcquisitionEngine::new(
@@ -249,7 +230,6 @@ async fn build_venues(
             risk.criteria,
             risk.take_profit,
             config.risk.max_position_size,
-            Some(solana_safety_gate),
         ),
         position_manager: PositionManager::new(solana_exchange),
         source: Box::new(pumpfun_source),
@@ -305,10 +285,6 @@ async fn build_venues(
             )))),
             ExecutionMode::DetectionOnly => Arc::new(NoWalletEvmExchange),
         };
-        let evm_safety = SafetyGate::new(
-            Arc::new(HoneypotEvmSafetyChecker::new(chain_config.chain_id)),
-            risk.safety_criteria,
-        );
 
         venues.push(VenueHandle {
             acquisition: AcquisitionEngine::new(
@@ -318,7 +294,6 @@ async fn build_venues(
                 risk.criteria,
                 risk.take_profit,
                 config.risk.max_position_size,
-                Some(evm_safety),
             ),
             position_manager: PositionManager::new(evm_exchange),
             source: Box::new(source),
@@ -422,10 +397,6 @@ async fn main() {
             AcquisitionCriteria::new(config.risk.min_volume_24h),
             "risk.min_volume_24h",
         ),
-        safety_criteria: SafetyCriteria::new(
-            config.safety.max_sell_tax_bps,
-            config.safety.max_token_transfer_fee_bps,
-        ),
     };
 
     info!(
@@ -436,8 +407,6 @@ async fn main() {
         max_consecutive_failures = config.risk.max_consecutive_failures,
         max_new_listings_per_cycle = config.risk.max_new_listings_per_cycle,
         entry_kill_switch_file = %config.risk.entry_kill_switch_file,
-        max_sell_tax_bps = config.safety.max_sell_tax_bps,
-        max_token_transfer_fee_bps = config.safety.max_token_transfer_fee_bps,
         evm_chains = config.evm_chains.len(),
         execution_mode = ?config.execution_mode,
         poll_interval_seconds = config.risk.poll_interval_seconds,

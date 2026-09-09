@@ -1,4 +1,4 @@
-//! EVM detection, market-data enrichment, safety checks, and Uniswap-V2-style
+//! EVM detection, market-data enrichment, and Uniswap-V2-style
 //! execution for the trading pipeline.
 //!
 //! Detection remains factory-log based. Trading uses Alloy with a local
@@ -23,10 +23,10 @@ use async_trait::async_trait;
 use ben_snipes_adapter_ws_support::connect_with_backoff;
 use ben_snipes_domain::{
     Chain, DomainError, FilledBuy, FilledSell, Listing, ListingMetrics, Order, OrderSide,
-    SafetyReport, Symbol, Venue, VenueKind,
+    Symbol, Venue, VenueKind,
 };
 use ben_snipes_ports::{
-    ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError, TokenSafetyChecker,
+    ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError,
 };
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
@@ -262,90 +262,6 @@ impl MetricsProvider for DexScreenerEvmMetrics {
             market_cap: Decimal::try_from(market_cap).map_err(|e| PortError::MalformedResponse {
                 venue: "dexscreener".to_string(), reason: format!("invalid market cap: {e}"),
             })?,
-        }))
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct HoneypotResponse {
-    #[serde(rename = "simulationSuccess", default)] simulation_success: bool,
-    #[serde(rename = "honeypotResult")] honeypot_result: Option<HoneypotResult>,
-    #[serde(rename = "simulationResult")] simulation_result: Option<HoneypotSimulation>,
-    summary: Option<HoneypotSummary>,
-    #[serde(rename = "contractCode")] contract_code: Option<HoneypotContractCode>,
-}
-#[derive(Debug, serde::Deserialize)]
-struct HoneypotResult { #[serde(rename = "isHoneypot")] is_honeypot: bool }
-#[derive(Debug, serde::Deserialize)]
-struct HoneypotSimulation { #[serde(rename = "sellTax")] sell_tax: f64 }
-#[derive(Debug, serde::Deserialize)]
-struct HoneypotSummary { #[serde(rename = "riskLevel")] risk_level: Option<u8> }
-#[derive(Debug, serde::Deserialize)]
-struct HoneypotContractCode { #[serde(rename = "rootOpenSource")] root_open_source: Option<bool> }
-
-pub struct HoneypotEvmSafetyChecker {
-    chain_id: u64,
-    http: reqwest::Client,
-}
-
-impl HoneypotEvmSafetyChecker {
-    pub fn new(chain_id: u64) -> Self {
-        Self { chain_id, http: reqwest::Client::new() }
-    }
-}
-
-#[async_trait]
-impl TokenSafetyChecker for HoneypotEvmSafetyChecker {
-    async fn assess(&self, symbol: &Symbol) -> Result<Option<SafetyReport>, PortError> {
-        let response = self.http.get("https://api.honeypot.is/v2/IsHoneypot")
-            .query(&[("address", symbol.as_str()), ("chainID", &self.chain_id.to_string())])
-            .send().await.map_err(|e| PortError::Network {
-                venue: "honeypot.is".to_string(), source: Box::new(e),
-            })?;
-        if !response.status().is_success() { return Ok(None); }
-        let report: HoneypotResponse = response.json().await.map_err(|e| PortError::MalformedResponse {
-            venue: "honeypot.is".to_string(), reason: e.to_string(),
-        })?;
-        let Some(simulation) = report.simulation_result else { return Ok(None); };
-        if !report.simulation_success { return Ok(None); }
-        if report.honeypot_result.as_ref().map(|r| r.is_honeypot).unwrap_or(true) { return Ok(None); }
-        let Some(risk_level) = report.summary.and_then(|s| s.risk_level) else { return Ok(None); };
-        if risk_level >= 20 { return Ok(None); }
-        if !simulation.sell_tax.is_finite() || simulation.sell_tax < 0.0 || simulation.sell_tax > 100.0 {
-            return Err(PortError::MalformedResponse {
-                venue: "honeypot.is".to_string(), reason: "invalid sell tax".to_string(),
-            });
-        }
-        let sell_tax_bps = Decimal::try_from(simulation.sell_tax * 100.0)
-            .map_err(|e| PortError::MalformedResponse { venue: "honeypot.is".to_string(), reason: e.to_string() })?
-            .round_dp(0).to_u32().ok_or_else(|| PortError::MalformedResponse {
-                venue: "honeypot.is".to_string(), reason: "sell tax overflow".to_string(),
-            })?;
-        let root_open_source = report.contract_code.and_then(|c| c.root_open_source).unwrap_or(false);
-        if !root_open_source { return Ok(None); }
-
-        // honeypot.is's composite verdict only speaks to buy/sell
-        // simulation, honeypot classification, risk score, and source
-        // verification - it does not tell us whether the contract still
-        // has a mint function, whether ownership is renounced, whether
-        // liquidity is locked, or the real token-level transfer fee.
-        // Reporting those as "safe" defaults would be exactly the
-        // fail-open bug this codebase's safety model exists to prevent
-        // (see `SafetyCriteria::passes`), so they are reported as
-        // unverified/failing here rather than guessed. A real EVM
-        // deployment needs a genuine mint-authority/ownership/liquidity
-        // -lock data source (e.g. a contract-analysis or token-scanner
-        // API) wired in before autonomous EVM buys can pass this gate -
-        // simulating success and a low honeypot risk score is
-        // necessary but not sufficient.
-        Ok(Some(SafetyReport {
-            sell_tax_bps: Some(sell_tax_bps),
-            token_transfer_fee_bps: None,
-            sellability: ben_snipes_domain::SellabilityEvidence::Simulated,
-            has_permanent_delegate: false,
-            ownership_renounced: false,
-            liquidity_locked: false,
-            is_mintable: true,
         }))
     }
 }

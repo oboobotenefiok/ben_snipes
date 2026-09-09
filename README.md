@@ -11,14 +11,13 @@ edge is being early. See "Automation & execution platforms" below for
 how buys/sells are meant to actually get executed.
 
 **Status: the Solana pipeline is fully wired end to end.** Real
-detection, real volume filtering (DexScreener), a real safety gate
-(RugCheck), a real cross-source dedup ledger, and - when
-`SOLANA_PRIVATE_KEY` is set - real buy/sell execution. **This means it
+detection, real volume filtering (DexScreener), a real cross-source
+deduplication ledger, and - if `SOLANA_PRIVATE_KEY` is set - real
+buy/sell execution. **This means it
 can autonomously spend real funds.** See "Automation & execution
 platforms" for exactly what's verified vs. best-effort in each piece,
-and read every module doc comment it points to before funding a
+and review the execution module documentation before funding a
 wallet. EVM now has real Alloy-based execution, private-RPC submission,
-DexScreener metrics, and Honeypot.is sell simulation. Live EVM execution
 requires an `EVM_PRIVATE_KEY` plus a configured private RPC.
 
 ## Architecture
@@ -28,11 +27,9 @@ Hexagonal (ports and adapters), split across a Cargo workspace:
 ```
 crates/domain/       pure business types and rules: Listing, Chain,
                       CanonicalTokenId, Position, ProfitTarget,
-                      AcquisitionCriteria, SafetyCriteria. No I/O.
 crates/ports/         traits the application depends on: ListingSource,
                       ListingStateStore, AcquisitionLedger, PositionStore,
                       ExchangeClient, MetricsProvider,
-                      TokenSafetyChecker, Clock.
 crates/application/   use cases: NewListingDetector, AcquisitionEngine,
                       PositionManager. Depends only on domain + ports.
 crates/config/        typed config loading (TOML + env overrides).
@@ -49,7 +46,6 @@ crates/adapters/
                       execution.rs (signing/broadcast) +
                       exchange_client.rs (buy/sell, falls back to
                       detection-only with no wallet), metrics_provider.rs
-                      (DexScreener volume), safety_checker.rs (RugCheck),
                       price_feed.rs (Jupiter price, SOL-denominated),
                       retry.rs (shared retry-with-backoff for the
                       transient-failure-prone network calls above).
@@ -88,7 +84,7 @@ and seen-key state. The runner retries pending candidates every
 `risk.pending_listing_retry_seconds` seconds. A pending candidate gets a full
 24-hour retry window starting when it enters the pending queue. During that
 window, a token that later becomes indexed or later reaches the required volume
-can still be bought, subject to the normal safety gate and all entry
+can still be bought, subject to the volume threshold and all entry
 guardrails.
 
 Only a definitive rejection, a successful acquisition, or expiry of the
@@ -166,14 +162,11 @@ that arrive *after* the websocket connects, with no historical replay.
 A future adapter with true cursor persistence (resuming from a stored
 block number after a restart) would need to apply this rule explicitly.
 
-### Autonomous acquisition, safety gate, and exit
+### Autonomous acquisition and exit
 
 `AcquisitionEngine` per detected listing: check volume via
 `MetricsProvider` -> check `AcquisitionCriteria` (`risk.min_volume_24h`,
-the sole gate - market cap doesn't disqualify a listing either way) ->
-check the optional `SafetyGate` (honeypot/rug signals: sell tax,
-ownership renounced, liquidity locked, mintable supply -
-`safety.max_sell_tax_bps` in config) -> reserve the `CanonicalTokenId`
+the sole acquisition gate - market cap does not disqualify a listing) ->
 in the ledger -> size from `risk.max_position_size` and buy.
 `PositionManager` then watches every open position and exits once
 `risk.take_profit_percent` is reached - and only then. There is no
@@ -181,7 +174,7 @@ stop-loss: a position that drops after entry is simply held, however
 long it takes to recover to target, rather than sold at a loss. This is
 a deliberate strategy choice ("10% or nothing"), not an oversight.
 
-**Paper mode** uses the same real market-data and safety providers while
+**Paper mode** uses the same real market-data providers while
 replacing execution with a `PaperExchange`. No wallet key is required, and
 no transaction is signed or submitted. **Live mode** uses the configured
 Solana/EVM execution adapters and can spend real funds. **Detection-only**
@@ -235,42 +228,7 @@ matched what the venue needed. Selling stays quantity-based
 (`submit_order`) since by the time you're exiting, the quantity is
 already known - it's the position you're holding.
 
-**Volume filtering, safety gate, and price monitoring are now real too -
-at three different confidence levels, and it matters which is which:**
-
-- **`current_price` (Jupiter Price API v3, `price_feed.rs`) - high
-  confidence.** Verified against a literal example response in Jupiter's
-  own docs. One easy-to-miss detail already handled: Jupiter's prices
-  are USD-denominated, but `entry_price` throughout this codebase is
-  SOL-denominated (it comes from `quote_amount spent in SOL / quantity
-  received`). Comparing a raw USD price against a SOL-denominated
-  take-profit target would be wrong by roughly the SOL/USD
-  exchange rate, not a rounding error - `fetch_price` converts by
-  fetching SOL's own price in the same batched call.
-- **`MetricsProvider` (DexScreener single-token lookup,
-  `metrics_provider.rs`) - high confidence.** Free, keyless, well
-  corroborated. Note this is a *different* DexScreener endpoint than the
-  one this project deliberately avoided for detection - that was the
-  paginated new-pairs firehose; this is a single lookup by an address
-  you already have, which was never the endpoint with the pagination
-  problem.
-- **`TokenSafetyChecker` (RugCheck, `safety_checker.rs`) - mixed
-  confidence, and the module doc comment is explicit about which parts.**
-  `mintAuthority`/`freezeAuthority` field names are independently
-  corroborated by two sources. Liquidity-lock detection is best-effort.
-  **Sell-tax detection is not meaningfully implemented** - RugCheck
-  does not provide a verified DEX sell-tax value, so `sell_tax_bps` remains
-  `None`. The safety model now keeps DEX sell tax separate from Token-2022
-  transfer fees and from sellability evidence, so a token transfer fee can
-  never be mistaken for proof that a DEX sell will succeed. There's also a
-  residual risk
-  worth naming directly: if the two authority field names turn out to be
-  wrong, they'd silently read as "renounced" (safe) rather than erroring
-  - fail-*open*, the opposite of this codebase's usual default. One
-  fail-closed guard is in place (a missing `token` sub-object entirely
-  aborts the assessment), but it can't catch a merely-wrong field name
-  within an otherwise-present object. Verify against a live response
-  before trusting this with real funds.
+**Volume filtering and price monitoring are now real.**
 
 **The port-shape mismatch flagged two rounds ago is fixed.**
 `ExchangeClient` used to only offer a quantity-based `submit_order`,
@@ -304,8 +262,6 @@ exit checks while new entries are paused.
 **Consolidated risk summary, because this is the round where the bot
 became capable of spending real funds:** (1) the signing code in
 `execution.rs` is pinned to the current `solana-sdk` 4.1.0 shape and now
-validates the returned transaction before signing; (2) RugCheck's
-ability to verify sell-tax is still absent, and the safety gate now
 fails closed on an unknown sell-tax value; (3) `simulateTransaction`
 preflight now runs before signing on both entry transactions and the exact
 sell transaction immediately before an exit; (4) this environment still
@@ -320,8 +276,6 @@ simulated before signing, and the signed EIP-2718 transaction is submitted
 through the configured private RPC. The adapter verifies the connected chain
 ID before execution, serializes wallet writes to prevent in-process nonce
 collisions, and derives EVM sell proceeds from the wallet balance delta plus
-the confirmed transaction gas cost. EVM safety uses Honeypot.is buy/sell simulation and
-requires a successful simulation, no honeypot verdict, low scanner risk,
 verified root source, and a measured sell tax below the configured limit.
 
 ## Continuous integration
@@ -347,9 +301,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 `cargo run --bin ben_snipes` starts the poll loop using the configured
 `execution_mode`. `paper` runs the synthetic demo plus real read-only market
-data and safety checks without signing or submitting trades. `live` uses the
+data without signing or submitting trades. `live` uses the
 real execution adapters. `detection_only` observes listings without trading.
-The real PumpPortal Solana source (real detection, real volume/safety filtering, and real buy/sell
+The real PumpPortal Solana source (real detection, real volume filtering, and real buy/sell
 execution if `SOLANA_PRIVATE_KEY` is set - **this can spend real
 funds**, see "Automation & execution platforms" before setting it), and
 any EVM chains listed in `config/default.toml`'s `evm_chains` (empty by
@@ -374,53 +328,9 @@ most wallet exports use. Leave it unset to run detection-only. **Read
 the warnings in "Automation & execution platforms" before setting this
 to a real, funded wallet's key.**
 
-## Remaining work
+## Current implementation
 
-- **Real Solana entry-side sell-tax detection.** `RugCheckSafetyChecker` does
-  not expose a verified DEX sell-tax value, so it reports `sell_tax_bps = None`
-  and the safety gate rejects the listing. The checker now separately inspects
-  the mint program and Token-2022 transfer-fee/permanent-delegate state.
-  Sellability evidence is represented explicitly as simulated vs structural,
-  rather than collapsing those signals into one tax number. Solana still does
-  not get a pre-entry simulated DEX sell, so this remains fail-closed.
-- **EVM routing beyond Uniswap-V2-compatible routers.** The current live EVM
-  path deliberately uses a configured V2-compatible router and native-coin
-  paths. An aggregator integration can be added later without changing the
-  application ports.
-- **Execution-quality modelling.** The persistent journal now records actual
-  settlement quantity, proceeds, fees, and transaction identifiers whenever
-  the venue exposes them, including confirmed EVM native proceeds and gas
-  costs. Remaining work is deeper execution-quality data,
-  such as route-level price impact and venue-specific fee attribution.
-- **Metrics/telemetry depth.** A local Prometheus-compatible `/metrics`
-  endpoint now exports runtime counters and the open-position gauge. Richer
-  OpenTelemetry traces and venue-labelled metrics can be added later.
-- **Historical backtesting realism.** Historical replay is implemented, but
-  it remains a strategy replay rather than a microstructure simulator. Spread,
-  latency, liquidity depth, MEV, and partial-fill modelling can be added later.
-- **Wallet secrets management.** `SOLANA_PRIVATE_KEY` is read directly
-  from the environment - fine for a single trusted deployment, not for
-  production secrets hygiene. A real deployment wants this from a
-  secrets manager (Vault, AWS Secrets Manager, etc.), ideally with an
-  HSM, and a hot wallet capped to what you can afford to lose regardless.
-- **Multi-instance ledger/position-store coordination.** Both
-  `AcquisitionLedger` and `PositionStore` are atomic within one running
-  process only - not across multiple bot instances sharing the same
-  state directory.
-- **EVM `topic0` values.** Not hardcoded anywhere on purpose - see
-  `ben_snipes-adapter-evm-onchain`'s crate docs for why, and what to do
-  instead before enabling a chain.
-- **`retry.rs`'s closure-capture pattern needs a compiler to confirm.**
-  `with_retry(3, || async { ... })` - no `move` on either layer - is
-  used at three call sites (`execute_trade`'s HTTP request,
-  `token_balance`, `sol_balance`). The reasoning it's correct: `with_retry`
-  awaits each attempt sequentially before calling again, so nothing needs
-  to outlive the call in a way that would force `move`, and everything
-  captured is either a reference or only ever borrowed, never consumed,
-  inside the closure body. This is exactly the kind of thing manual
-  review can get subtly wrong, though (a real compile error was already
-  caught and fixed once this session in a different file) - it's the
-  first thing to check if these three specific call sites fail to build.
+The acquisition path is intentionally minimal: source-level deduplication, 24h volume filtering, cross-source acquisition-ledger reservation, exchange execution prechecks, buy execution, position tracking, and take-profit exits.
 
 ## License
 
@@ -428,7 +338,7 @@ MIT - see `LICENSE`.
 
 ## Historical replay / backtesting
 
-The workspace now includes a deterministic replay engine and `ben_snipes-backtest` binary. It consumes a JSON dataset containing timestamped listing observations, reference prices, 24h volume, market cap, and safety reports, then applies the same acquisition criteria, safety criteria, position sizing, maximum-position cap, and take-profit rule used by the application.
+The workspace now includes a deterministic replay engine and `ben_snipes-backtest` binary. It consumes a JSON dataset containing timestamped listing observations, reference prices, 24h volume and market cap, then applies the same volume acquisition criteria, position sizing, maximum-position cap, and take-profit rule used by the application.
 
 Example:
 

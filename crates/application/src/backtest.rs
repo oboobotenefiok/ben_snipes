@@ -1,12 +1,12 @@
 //! Deterministic historical replay for the acquisition and take-profit rules.
 //!
 //! This module intentionally does not pretend to reproduce venue microstructure.
-//! It replays timestamped listing observations, volume, safety data, and a
-//! reference price through the same domain rules used by live trading.
+//! It replays timestamped listing observations, volume, and a reference
+//! price through the same acquisition and take-profit rules used by live trading.
 
 use ben_snipes_domain::{
     AcquisitionCriteria, Listing, ListingMetrics, PerformanceSummary, Position, ProfitTarget,
-    SafetyCriteria, SafetyReport, TradeRecord,
+    TradeRecord,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -19,15 +19,11 @@ pub struct BacktestEvent {
     pub listing: Listing,
     pub price: Decimal,
     pub metrics: Option<ListingMetrics>,
-    pub safety: Option<SafetyReport>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BacktestConfig {
     pub min_volume_24h: Decimal,
-    pub max_sell_tax_bps: u32,
-    #[serde(default)]
-    pub max_token_transfer_fee_bps: u32,
     pub take_profit_percent: Decimal,
     pub position_size: Decimal,
     pub max_open_positions: usize,
@@ -73,7 +69,6 @@ pub struct BacktestEngine {
     config: BacktestConfig,
     criteria: AcquisitionCriteria,
     target: ProfitTarget,
-    safety_criteria: SafetyCriteria,
 }
 
 impl BacktestEngine {
@@ -88,15 +83,10 @@ impl BacktestEngine {
             .map_err(|e| e.to_string())?;
         let target = ProfitTarget::from_percent(config.take_profit_percent)
             .map_err(|e| e.to_string())?;
-        let safety_criteria = SafetyCriteria::new(
-            config.max_sell_tax_bps,
-            config.max_token_transfer_fee_bps,
-        );
         Ok(Self {
             config,
             criteria,
             target,
-            safety_criteria,
         })
     }
 
@@ -159,16 +149,6 @@ impl BacktestEngine {
                 continue;
             }
 
-            let Some(safety) = event.safety else {
-                pending_listings.insert(key);
-                report.pending_events = report.pending_events.saturating_add(1);
-                continue;
-            };
-            if !self.safety_criteria.passes(&safety) {
-                pending_listings.remove(&key);
-                report.rejected_events = report.rejected_events.saturating_add(1);
-                continue;
-            }
 
             if event.price <= Decimal::ZERO {
                 pending_listings.remove(&key);
@@ -216,23 +196,12 @@ mod tests {
                 volume_24h: Decimal::from(volume),
                 market_cap: Decimal::from(100_000),
             }),
-            safety: Some(SafetyReport {
-                sell_tax_bps: Some(100),
-                token_transfer_fee_bps: Some(0),
-                sellability: ben_snipes_domain::SellabilityEvidence::Simulated,
-                has_permanent_delegate: false,
-                ownership_renounced: true,
-                liquidity_locked: false,
-                is_mintable: false,
-            }),
         }
     }
 
     fn engine() -> BacktestEngine {
         BacktestEngine::new(BacktestConfig {
-            min_volume_24h: Decimal::from(50_000),
-            max_sell_tax_bps: 1_000,
-            max_token_transfer_fee_bps: 0,
+            min_volume_24h: Decimal::ONE,
             take_profit_percent: Decimal::TEN,
             position_size: Decimal::from(100),
             max_open_positions: 2,
@@ -256,28 +225,14 @@ mod tests {
     #[test]
     fn low_volume_remains_pending_and_does_not_open() {
         let report = engine().run(vec![
-            event(1, "AAA", 10, 1_000),
-            event(2, "AAA", 10, 100_000),
+            event(1, "AAA", 10, 0),
+            event(2, "AAA", 10, 1),
         ]);
         assert_eq!(report.entries_opened, 1);
         assert_eq!(report.pending_events, 1);
         assert!(report.trades.is_empty());
     }
 
-    #[test]
-    fn failed_safety_is_rejected() {
-        let mut first = event(1, "AAA", 10, 100_000);
-        first.safety = Some(SafetyReport {
-            sell_tax_bps: None,
-            token_transfer_fee_bps: Some(0),
-            sellability: ben_snipes_domain::SellabilityEvidence::Simulated,
-            has_permanent_delegate: false,
-            ..first.safety.expect("test event has safety")
-        });
-        let report = engine().run(vec![first]);
-        assert_eq!(report.entries_opened, 0);
-        assert_eq!(report.rejected_events, 1);
-    }
 
     #[test]
     fn holds_losses_until_take_profit() {

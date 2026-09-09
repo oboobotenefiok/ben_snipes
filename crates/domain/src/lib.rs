@@ -14,7 +14,6 @@ mod error;
 mod listing;
 mod order;
 mod position;
-mod safety;
 mod trade;
 mod venue;
 
@@ -25,6 +24,5 @@ pub use error::DomainError;
 pub use listing::{Listing, Symbol};
 pub use order::{FilledBuy, FilledSell, Order, OrderSide, OrderStatus};
 pub use position::{Position, ProfitTarget};
-pub use safety::{SafetyCriteria, SafetyReport, SellabilityEvidence};
 pub use trade::{PerformanceSummary, TradeRecord};
 pub use venue::{Venue, VenueKind};

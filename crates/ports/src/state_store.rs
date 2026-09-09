@@ -13,7 +13,7 @@ use time::OffsetDateTime;
 /// store - whatever `ListingStateStore` adapter is wired in).
 ///
 /// A listing that remains eligible for periodic re-evaluation while
-/// external metrics or safety data are incomplete or below the buy threshold.
+/// external metrics data is incomplete or below the buy threshold.
 /// `pending_since` is the start of the fixed 24-hour retry window.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PendingListing {

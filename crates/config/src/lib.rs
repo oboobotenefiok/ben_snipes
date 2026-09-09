@@ -83,19 +83,6 @@ pub struct RiskConfig {
     pub entry_kill_switch_file: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct SafetyConfig {
-    /// Maximum acceptable sell tax, in basis points (100 = 1%), for a
-    /// DEX listing to pass the honeypot/rug safety gate. Only applies to
-    /// venues that have a `SafetyGate` configured - see the README.
-    pub max_sell_tax_bps: u32,
-    #[serde(default = "default_max_token_transfer_fee_bps")]
-    pub max_token_transfer_fee_bps: u32,
-}
-
-fn default_max_token_transfer_fee_bps() -> u32 {
-    0
-}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ObservabilityConfig {
@@ -186,7 +173,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub execution_mode: ExecutionMode,
     pub risk: RiskConfig,
-    pub safety: SafetyConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
     pub storage: StorageConfig,

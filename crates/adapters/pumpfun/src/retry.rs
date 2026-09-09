@@ -1,10 +1,10 @@
 //! A small retry-with-backoff helper for the transient-failure-prone
 //! network calls throughout this crate (RPC calls, PumpPortal/DexScreener/
-//! RugCheck/Jupiter HTTP requests).
+//! Jupiter HTTP requests).
 //!
 //! **Every call site this is used on has been checked for idempotency
 //! before wrapping it** - retrying isn't free to reach for blindly.
-//! Reads (balance checks, price/metrics/safety lookups) are always safe
+//! Reads (balance checks, price/metrics lookups) are always safe
 //! to retry. The two calls that "do" something - requesting an unsigned
 //! transaction from PumpPortal, and broadcasting a signed one - are also
 //! safe here specifically: `trade-local` is a stateless "build me a

@@ -13,19 +13,17 @@
 //! (`#[serde(default)]` on every field) specifically so a schema drift
 //! shows up as "fewer listings than expected" rather than a hard crash.
 //!
-//! Detection is provided by PumpPortal, while metrics come from
-//! DexScreener and authority/liquidity checks come from RugCheck. Sell-tax
-//! remains explicitly unknown until a real sell simulation is available,
-//! so the application safety gate blocks the purchase.
+//! Detection is provided by PumpPortal, while volume metrics come from
+//! DexScreener.
 
 use async_trait::async_trait;
 use ben_snipes_adapter_ws_support::connect_with_backoff;
 use ben_snipes_domain::{
-    Chain, DomainError, FilledBuy, FilledSell, Listing, ListingMetrics, Order, SafetyReport,
+    Chain, DomainError, FilledBuy, FilledSell, Listing, ListingMetrics, Order,
     Symbol, Venue, VenueKind,
 };
 use ben_snipes_ports::{
-    ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError, TokenSafetyChecker,
+    ExchangeClient, ListingSnapshot, ListingSource, MetricsProvider, PortError,
 };
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
@@ -40,11 +38,9 @@ pub mod execution;
 pub mod metrics_provider;
 pub mod price_feed;
 pub mod retry;
-pub mod safety_checker;
 pub use exchange_client::PumpPortalExchangeClient;
 pub use execution::{execute_trade, load_wallet, wallet_pubkey_string, TradeAction, TradeRequest};
 pub use metrics_provider::DexScreenerMetricsProvider;
-pub use safety_checker::RugCheckSafetyChecker;
 
 pub const DEFAULT_WS_URL: &str = "wss://pumpportal.fun/api/data";
 
@@ -160,17 +156,6 @@ pub struct NotYetImplementedMetrics;
 #[async_trait]
 impl MetricsProvider for NotYetImplementedMetrics {
     async fn metrics(&self, _symbol: &Symbol) -> Result<Option<ListingMetrics>, PortError> {
-        Ok(None)
-    }
-}
-
-/// Always-`None` `TokenSafetyChecker` - the safe default until real
-/// pump.fun contract/authority checks are wired in. See the module docs.
-pub struct NotYetImplementedSafetyChecker;
-
-#[async_trait]
-impl TokenSafetyChecker for NotYetImplementedSafetyChecker {
-    async fn assess(&self, _symbol: &Symbol) -> Result<Option<SafetyReport>, PortError> {
         Ok(None)
     }
 }
