@@ -9,36 +9,25 @@
 //! configured chain, a direct EVM factory-log subscription (via
 //! `ben_snipes-adapter-evm-onchain`).
 //!
-//! **The Solana pipeline is now fully wired end to end**: real
-//! detection, real volume filtering (DexScreener), a real cross-source
-//! dedup ledger, and - if
-//! `SOLANA_PRIVATE_KEY` is set - real buy/sell execution. That means
-//! this can autonomously spend real funds the moment a wallet is
-//! configured. Every piece added this way carries its own confidence
-//! caveat in its module docs (`execution.rs` for signing, `price_feed.rs` for the
-//! SOL-denomination fix) - read them before funding a wallet, not after.
-//! EVM execution is wired through Alloy and an optional private RPC. A
-//! `dex-mock` demo venue is available in paper mode so `cargo run` can
-//! demonstrate the full pipeline end to end with synthetic data,
-//! independent of any funded wallet.
+//! The Solana pipeline is fully live: real detection, real volume filtering,
+//! cross-source deduplication, mandatory wallet loading, and real buy/sell execution.
+//! Every position exit cycle uses the shared Jupiter batch price cache.
+//! EVM execution is wired through Alloy and an optional private RPC.
 
-use ben_snipes_adapter_dex_mock::{MockDexClient, MockDexSource};
 use ben_snipes_adapter_evm_onchain::{
     DexScreenerEvmMetrics, EvmFactoryConfig, EvmFactoryLogSource, EvmUniswapV2Exchange,
-    NoWalletEvmExchange,
 };
 use ben_snipes_adapter_pumpfun::{
-    load_wallet, wallet_pubkey_string, DexScreenerMetricsProvider, NoWalletExchange,
-    PumpPortalExchangeClient, PumpPortalSource,
+    load_wallet, wallet_pubkey_string, DexScreenerMetricsProvider, PumpPortalExchangeClient, PumpPortalSource,
 };
 use ben_snipes_adapter_statefile::{
     FileAcquisitionLedger, FilePendingTradeStore, FilePositionStore, FileTradeStore, InstanceLock,
     StatefileStore,
 };
-use ben_snipes_application::{AcquisitionDecision, AcquisitionEngine, NewListingDetector, PaperExchange, PositionManager, RuntimeMetrics};
-use ben_snipes_config::{AppConfig, ExecutionMode};
+use ben_snipes_application::{AcquisitionDecision, AcquisitionEngine, NewListingDetector, PositionManager, RuntimeMetrics};
+use ben_snipes_config::AppConfig;
 use ben_snipes_domain::{
-    AcquisitionCriteria, ListingMetrics, PerformanceSummary, Position, ProfitTarget, TradeRecord,
+    AcquisitionCriteria, PerformanceSummary, Position, ProfitTarget, TradeRecord,
 };
 use ben_snipes_ports::{
     AcquisitionLedger, ExchangeClient, ListingSource, PendingTradeStore, PositionStore,
@@ -59,6 +48,7 @@ struct VenueHandle {
     source: Box<dyn ListingSource>,
     acquisition: AcquisitionEngine,
     position_manager: PositionManager,
+    price_metrics: Option<Arc<ben_snipes_adapter_pumpfun::PumpPortalExchangeClient>>,
 }
 
 /// Config values that violate a domain rule are a startup-time problem,
@@ -134,6 +124,18 @@ fn validate_runtime_config(config: &AppConfig) -> Result<(), String> {
     if config.risk.pending_listing_retry_seconds == 0 {
         return Err("risk.pending_listing_retry_seconds must be greater than zero".to_string());
     }
+    if config.observability.price_cache_ttl_seconds == 0 {
+        return Err("observability.price_cache_ttl_seconds must be greater than zero".to_string());
+    }
+    if config.observability.jupiter_max_retries == 0 {
+        return Err("observability.jupiter_max_retries must be greater than zero".to_string());
+    }
+    if config.observability.jupiter_circuit_breaker_failures == 0 {
+        return Err("observability.jupiter_circuit_breaker_failures must be greater than zero".to_string());
+    }
+    if config.observability.jupiter_circuit_breaker_cooldown_seconds == 0 {
+        return Err("observability.jupiter_circuit_breaker_cooldown_seconds must be greater than zero".to_string());
+    }
     if config.solana.priority_fee_sol < Decimal::ZERO {
         return Err("solana.priority_fee_sol must not be negative".to_string());
     }
@@ -158,68 +160,29 @@ async fn build_venues(
 ) -> Vec<VenueHandle> {
     let mut venues = Vec::new();
 
-    // --- Demo venue -----------------------------------------------------
-    // Synthetic data is useful for paper mode, but it must never create a
-    // fake position during a live deployment. Keeping it explicitly scoped
-    // to paper mode removes a surprisingly dangerous source of false trades.
-    if config.execution_mode == ExecutionMode::Paper {
-        let dex_client = Arc::new(MockDexClient::new("raydium-demo", Decimal::ONE));
-        let dex_source = MockDexSource::new("raydium-demo");
+    let wallet = match load_wallet() {
+        Ok(wallet) => wallet,
+        Err(reason) => {
+            eprintln!("SOLANA_PRIVATE_KEY is required for live trading: {reason}");
+            std::process::exit(1);
+        }
+    };
+    info!(pubkey = %wallet_pubkey_string(&wallet), "solana wallet loaded - live execution enabled");
 
-        dex_client
-            .set_metrics(
-                "NEWCOIN-SOL",
-                ListingMetrics {
-                    volume_24h: Decimal::from(90_000),
-                    market_cap: Decimal::from(300_000),
-                },
-            )
-            .await;
-        dex_source.simulate_new_pool("NEWCOIN-SOL").await;
-
-        let demo_exchange: Arc<dyn ExchangeClient> = Arc::new(PaperExchange::new(dex_client.clone()));
-        venues.push(VenueHandle {
-            acquisition: AcquisitionEngine::new(
-                dex_client.clone(),
-                demo_exchange.clone(),
-                ledger.clone(),
-                risk.criteria,
-                risk.take_profit,
-                config.risk.max_position_size,
-            ),
-            position_manager: PositionManager::new(demo_exchange),
-            source: Box::new(dex_source),
-        });
-    }
-
-    // --- Solana: real detection via PumpPortal -------------------------
     let pumpfun_source = expect_valid_config(
         PumpPortalSource::spawn(config.solana.pumpportal_ws_url.clone()),
         "solana pumpportal source",
     );
-
-    let solana_exchange: Arc<dyn ExchangeClient> = match config.execution_mode {
-        ExecutionMode::Live => match load_wallet() {
-            Ok(wallet) => {
-                info!(pubkey = %wallet_pubkey_string(&wallet), "solana wallet loaded - buy/sell execution is live");
-                Arc::new(PumpPortalExchangeClient::new(
-                    wallet,
-                    config.solana.rpc_url.clone(),
-                    config.solana.slippage_percent,
-                    config.solana.priority_fee_sol,
-                ))
-            }
-            Err(reason) => {
-                info!(reason = %reason, "no solana wallet configured - running pumpfun in detection-only mode");
-                Arc::new(NoWalletExchange)
-            }
-        },
-        ExecutionMode::Paper => Arc::new(PaperExchange::new(Arc::new(
-            PumpPortalExchangeClient::new_read_only(config.solana.rpc_url.clone()),
-        ))),
-        ExecutionMode::DetectionOnly => Arc::new(NoWalletExchange),
-    };
-
+    let solana_exchange = Arc::new(PumpPortalExchangeClient::new(
+        wallet,
+        config.solana.rpc_url.clone(),
+        config.solana.slippage_percent,
+        config.solana.priority_fee_sol,
+        Duration::from_secs(config.observability.price_cache_ttl_seconds),
+        config.observability.jupiter_max_retries,
+        config.observability.jupiter_circuit_breaker_failures,
+        Duration::from_secs(config.observability.jupiter_circuit_breaker_cooldown_seconds),
+    ));
     let solana_metrics = Arc::new(DexScreenerMetricsProvider::new());
 
     venues.push(VenueHandle {
@@ -231,11 +194,11 @@ async fn build_venues(
             risk.take_profit,
             config.risk.max_position_size,
         ),
-        position_manager: PositionManager::new(solana_exchange),
+        position_manager: PositionManager::new(solana_exchange.clone()),
+        price_metrics: Some(solana_exchange.clone()),
         source: Box::new(pumpfun_source),
     });
 
-    // --- EVM: real detection and execution per configured chain --------
     for chain_config in &config.evm_chains {
         let factory_config = EvmFactoryConfig {
             chain_name: chain_config.chain_name.clone(),
@@ -254,37 +217,17 @@ async fn build_venues(
             EvmFactoryLogSource::spawn(factory_config),
             &format!("evm_chains[{}] config", chain_config.chain_name),
         );
-
-        let evm_exchange: Arc<dyn ExchangeClient> = match config.execution_mode {
-            ExecutionMode::Live => match EvmUniswapV2Exchange::from_env(
+        let evm_exchange: Arc<dyn ExchangeClient> = Arc::new(expect_valid_config(
+            EvmUniswapV2Exchange::from_env(
                 chain_config.chain_id,
                 chain_config.execution_rpc_url.clone(),
                 chain_config.private_rpc_url.clone(),
                 &chain_config.router_address,
                 &chain_config.wrapped_native_address,
                 chain_config.slippage_percent,
-            ) {
-                Ok(exchange) => {
-                    info!(chain = %chain_config.chain_name, "EVM wallet loaded - execution is live");
-                    Arc::new(exchange)
-                }
-                Err(reason) => {
-                    info!(chain = %chain_config.chain_name, reason = %reason, "no EVM wallet configured - running EVM in detection-only mode");
-                    Arc::new(NoWalletEvmExchange)
-                }
-            },
-            ExecutionMode::Paper => Arc::new(PaperExchange::new(Arc::new(expect_valid_config(
-                EvmUniswapV2Exchange::read_only(
-                    chain_config.chain_id,
-                    chain_config.execution_rpc_url.clone(),
-                    &chain_config.router_address,
-                    &chain_config.wrapped_native_address,
-                    chain_config.slippage_percent,
-                ),
-                &format!("evm_chains[{}] read-only exchange", chain_config.chain_name),
-            )))),
-            ExecutionMode::DetectionOnly => Arc::new(NoWalletEvmExchange),
-        };
+            ),
+            &format!("evm_chains[{}] wallet/exchange", chain_config.chain_name),
+        ));
 
         venues.push(VenueHandle {
             acquisition: AcquisitionEngine::new(
@@ -296,12 +239,9 @@ async fn build_venues(
                 config.risk.max_position_size,
             ),
             position_manager: PositionManager::new(evm_exchange),
+            price_metrics: None,
             source: Box::new(source),
         });
-    }
-
-    if config.evm_chains.is_empty() {
-        info!("no evm_chains configured - EVM detection is inactive until config/default.toml lists at least one");
     }
 
     venues
@@ -408,7 +348,6 @@ async fn main() {
         max_new_listings_per_cycle = config.risk.max_new_listings_per_cycle,
         entry_kill_switch_file = %config.risk.entry_kill_switch_file,
         evm_chains = config.evm_chains.len(),
-        execution_mode = ?config.execution_mode,
         poll_interval_seconds = config.risk.poll_interval_seconds,
         "ben_snipes starting up"
     );
@@ -584,11 +523,6 @@ async fn main() {
 
                         info!(symbol = listing.symbol.as_str(), venue = %listing.venue, chain = %listing.chain, "new listing detected");
 
-                        if config.execution_mode == ExecutionMode::DetectionOnly {
-                            info!(symbol = listing.symbol.as_str(), "detection-only mode: acquisition skipped");
-                            continue;
-                        }
-
                         match venue.acquisition.evaluate_and_buy(&listing).await {
                             Ok(AcquisitionDecision::Opened(position)) => {
                                 runtime_metrics.inc_positions_opened();
@@ -633,100 +567,71 @@ async fn main() {
                     }
                 }
 
-                // 2. Check every open position against its venue's
-                //    current price and exit only when take-profit is reached.
-                // Detection-only mode deliberately leaves positions untouched.
-                if config.execution_mode == ExecutionMode::DetectionOnly {
-                    continue;
-                }
+                // 2. Check every venue's open positions in a single batch.
                 let mut still_open = Vec::with_capacity(open_positions.len());
-                for position in open_positions.drain(..) {
-                    let venue = venues
+                for venue in &venues {
+                    let venue_name = venue.source.source_id().to_string();
+                    let venue_positions: Vec<Position> = open_positions
                         .iter()
-                        .find(|v| v.source.source_id() == position.venue.name());
-
-                    let Some(venue) = venue else {
-                        warn!(venue = %position.venue, "no handle found for this venue, retaining position for later recovery");
-                        still_open.push(position);
+                        .filter(|position| position.venue.name() == venue_name)
+                        .cloned()
+                        .collect();
+                    if venue_positions.is_empty() {
                         continue;
-                    };
-
-                    runtime_metrics.inc_exit_checks();
-                    match venue.position_manager.check_and_exit(&position).await {
-                        Ok(Some(exit)) => {
-                            consecutive_failures = 0;
-                            let trade = TradeRecord::from_fill(
-                                &position,
-                                &exit.fill,
-                                exit.reference_price,
-                                exit.closed_at,
-                            );
-                            match trade_store.append(&trade).await {
-                                Ok(()) => {
-                                    runtime_metrics.inc_exits_filled();
-                                    trade_history.push(trade.clone());
-                                    performance = PerformanceSummary::from_trades(&trade_history);
-                                    info!(
-                                        symbol = position.symbol.as_str(),
-                                        exit_price = %trade.exit_price,
-                                        execution_price_is_reference = trade.execution_price_is_reference,
-                                        tx_id = ?trade.tx_id,
-                                        fee_quote = %trade.fee_quote,
-                                        pnl = %trade.pnl,
-                                        realized_pnl = %performance.realized_pnl,
-                                        trades = performance.trade_count,
-                                        "take-profit reached, position closed and journaled"
-                                    );
-                                }
-                                Err(e) => {
-                                    runtime_metrics.inc_journal_errors();
-                                    consecutive_failures = consecutive_failures.saturating_add(1);
-                                    warn!(
-                                        symbol = position.symbol.as_str(),
-                                        error = %e,
-                                        exit_price = %trade.exit_price,
-                                        execution_price_is_reference = trade.execution_price_is_reference,
-                                        tx_id = ?trade.tx_id,
-                                        fee_quote = %trade.fee_quote,
-                                        pnl = %trade.pnl,
-                                        "position closed but failed to persist trade journal entry; queued for durable retry"
-                                    );
-                                    // The sell already executed - the position is
-                                    // gone either way - but the journal write
-                                    // failed, so this trade would otherwise be
-                                    // lost forever. Queue it in the durable
-                                    // pending-trade store so the top of the next
-                                    // tick (or a fresh process after a crash)
-                                    // retries the journal write instead of
-                                    // silently dropping the record.
-                                    trade_history.push(trade.clone());
-                                    performance = PerformanceSummary::from_trades(&trade_history);
-                                    info!(
-                                        trades = performance.trade_count,
-                                        wins = performance.winning_trades,
-                                        losses = performance.losing_trades,
-                                        flat = performance.flat_trades,
-                                        realized_pnl = %performance.realized_pnl,
-                                        "performance updated from an unjournaled trade pending durable retry"
-                                    );
-                                    pending_trades.push(trade);
-                                    if let Err(persist_err) = pending_trade_store.save(&pending_trades).await {
-                                        runtime_metrics.inc_journal_errors();
-                                        warn!(
-                                            error = %persist_err,
-                                            "failed to persist pending trade journal queue after a journal write failure"
-                                        );
+                    }
+                    runtime_metrics.inc_exit_checks_by(venue_positions.len());
+                    match venue.position_manager.check_and_exit_batch(&venue_positions).await {
+                        // Keep Prometheus price-cache counters synchronized with the shared Solana cache.
+                        Ok(exits) => {
+                            for position in venue_positions {
+                                if let Some(exit) = exits.iter().find(|exit| exit.symbol == position.symbol.as_str()) {
+                                            let trade = TradeRecord::from_fill(&position, &exit.fill, exit.reference_price, exit.closed_at);
+                                    match trade_store.append(&trade).await {
+                                        Ok(()) => {
+                                            runtime_metrics.inc_exits_filled();
+                                            trade_history.push(trade.clone());
+                                            performance = PerformanceSummary::from_trades(&trade_history);
+                                            info!(symbol = position.symbol.as_str(), exit_price = %trade.exit_price, tx_id = ?trade.tx_id, pnl = %trade.pnl, "take-profit reached, position closed and journaled");
+                                        }
+                                        Err(e) => {
+                                            runtime_metrics.inc_journal_errors();
+                                            warn!(symbol = position.symbol.as_str(), error = %e, "position closed but failed to persist trade journal entry");
+                                            trade_history.push(trade.clone());
+                                            performance = PerformanceSummary::from_trades(&trade_history);
+                                            pending_trades.push(trade);
+                                            if let Err(persist_err) = pending_trade_store.save(&pending_trades).await {
+                                                runtime_metrics.inc_journal_errors();
+                                                warn!(error = %persist_err, "failed to persist pending trade journal queue");
+                                            }
+                                        }
                                     }
+                                } else {
+                                    still_open.push(position);
                                 }
                             }
                         }
-                        Ok(None) => still_open.push(position),
                         Err(e) => {
-                            runtime_metrics.inc_exit_errors();
-                            consecutive_failures = consecutive_failures.saturating_add(1);
-                            warn!(symbol = position.symbol.as_str(), error = %e, "exit check failed, will retry next tick");
-                            still_open.push(position);
+                            runtime_metrics.inc_exit_errors_by(venue_positions.len());
+                            warn!(venue = %venue_name, error = %e, "batched exit check failed; positions retained");
+                            still_open.extend(venue_positions);
                         }
+                    }
+                    if let Some(exchange) = &venue.price_metrics {
+                        let stats = exchange.price_cache_stats();
+                        runtime_metrics.set_price_cache_stats(
+                            stats.hits,
+                            stats.misses,
+                            stats.batches,
+                            stats.requested_prices,
+                            stats.latency_ms_total,
+                            stats.latency_samples,
+                        );
+                    }
+                }
+                for position in open_positions.drain(..) {
+                    if !venues.iter().any(|venue| venue.source.source_id() == position.venue.name()) {
+                        warn!(venue = %position.venue, "no handle found for this venue, retaining position for later recovery");
+                        still_open.push(position);
                     }
                 }
                 open_positions = still_open;

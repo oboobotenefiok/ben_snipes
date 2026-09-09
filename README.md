@@ -12,7 +12,7 @@ how buys/sells are meant to actually get executed.
 
 **Status: the Solana pipeline is fully wired end to end.** Real
 detection, real volume filtering (DexScreener), a real cross-source
-deduplication ledger, and - if `SOLANA_PRIVATE_KEY` is set - real
+deduplication ledger, and - when `SOLANA_PRIVATE_KEY` is set - real
 buy/sell execution. **This means it
 can autonomously spend real funds.** See "Automation & execution
 platforms" for exactly what's verified vs. best-effort in each piece,
@@ -44,16 +44,14 @@ crates/adapters/
   pumpfun/             REAL Solana pipeline, six modules:
                       listing detection (PumpPortal websocket),
                       execution.rs (signing/broadcast) +
-                      exchange_client.rs (buy/sell, falls back to
-                      detection-only with no wallet), metrics_provider.rs
+                      exchange_client.rs (live buy/sell with mandatory wallet),
+                      metrics_provider.rs
                       price_feed.rs (Jupiter price, SOL-denominated),
                       retry.rs (shared retry-with-backoff for the
                       transient-failure-prone network calls above).
   evm-onchain/         REAL EVM ListingSource: subscribes directly to a
                       DEX factory's pair-creation logs over eth_subscribe.
                       Chain/factory/event-agnostic, configured per chain.
-  dex-mock/            synthetic venue used by paper mode to exercise the
-                      complete pipeline without signing or submitting trades.
 bin/runner/           composition root - the only crate that wires
                       concrete adapters into the application. Builds
                       to the `ben_snipes` binary.
@@ -146,7 +144,7 @@ multiple local processes from concurrently mutating the same state directory.
   arrived since the last poll; no diffing needed.
 - **Full-snapshot diff** (`ListingSnapshot::Full`) - a venue that only
   exposes "here's everything right now" gets diffed against a persisted
-  set of dedupe keys (`dex-mock` demonstrates this path).
+  set of dedupe keys (real adapters use the incremental path).
 
 The very first poll of a `Full` source establishes a baseline and
 reports nothing as new - without this, a bot's first poll of any
@@ -174,12 +172,7 @@ stop-loss: a position that drops after entry is simply held, however
 long it takes to recover to target, rather than sold at a loss. This is
 a deliberate strategy choice ("10% or nothing"), not an oversight.
 
-**Paper mode** uses the same real market-data providers while
-replacing execution with a `PaperExchange`. No wallet key is required, and
-no transaction is signed or submitted. **Live mode** uses the configured
-Solana/EVM execution adapters and can spend real funds. **Detection-only**
-mode watches sources and evaluates listings but never opens or closes a
-position.
+The bot is live-only. A Solana wallet is mandatory at startup, and configured EVM chains likewise require `EVM_PRIVATE_KEY` and a private execution RPC. The bot has no simulated or detection-only execution mode.
 
 ## Automation & execution platforms
 
@@ -195,9 +188,7 @@ stance taken everywhere else in this project. `PumpPortalExchangeClient`
 wraps this into a real `ExchangeClient`: buy confirms on-chain then
 reads the resulting balance via `getTokenAccountsByOwner` to report
 back actual quantity/entry price; sell offloads a known quantity the
-same way. If `SOLANA_PRIVATE_KEY` isn't set, `main.rs` falls back to
-`NoWalletExchange` automatically - detection keeps running, buying/
-selling just stays inert, rather than the whole bot refusing to start.
+same way. If `SOLANA_PRIVATE_KEY` is not set, startup fails clearly; the bot never enters a degraded execution mode.
 
 **This is the highest-risk code in the whole project, and it says so in
 its own doc comment.** `solana-sdk` went through a major breaking
@@ -299,17 +290,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-`cargo run --bin ben_snipes` starts the poll loop using the configured
-`execution_mode`. `paper` runs the synthetic demo plus real read-only market
-data without signing or submitting trades. `live` uses the
-real execution adapters. `detection_only` observes listings without trading.
-The real PumpPortal Solana source (real detection, real volume filtering, and real buy/sell
-execution if `SOLANA_PRIVATE_KEY` is set - **this can spend real
-funds**, see "Automation & execution platforms" before setting it), and
-any EVM chains listed in `config/default.toml`'s `evm_chains` (empty by
-default - see the commented example in that file for what's required to
-enable one: your own RPC websocket URL with an API key, and a verified
-`topic0` for the target factory's creation event).
+`cargo run --bin ben_snipes` starts the live poll loop. The Solana wallet is mandatory; the process exits before creating venues if `SOLANA_PRIVATE_KEY` is missing. Configured EVM chains also require their execution wallet and private RPC. The bot performs real execution only.
+
 
 **For a first real Solana run:** set `risk.max_position_size` in
 `config/default.toml` to the smallest amount you're willing to lose
@@ -324,7 +306,7 @@ and watching closely matters here more than in most projects.
 
 To enable Solana execution: `export SOLANA_PRIVATE_KEY="<base58-encoded
 secret key>"` before running - the base58 format `solana-keygen` and
-most wallet exports use. Leave it unset to run detection-only. **Read
+most wallet exports use. It is mandatory for startup. **Read
 the warnings in "Automation & execution platforms" before setting this
 to a real, funded wallet's key.**
 

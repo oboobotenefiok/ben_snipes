@@ -274,7 +274,7 @@ pub struct EvmUniswapV2Exchange {
     router: Address,
     wrapped_native: Address,
     slippage_percent: u32,
-    signer: Option<PrivateKeySigner>,
+    signer: PrivateKeySigner,
     write_lock: Arc<Mutex<()>>,
 }
 
@@ -302,39 +302,13 @@ impl EvmUniswapV2Exchange {
             router,
             wrapped_native,
             slippage_percent,
-            signer: Some(signer),
-            write_lock: Arc::new(Mutex::new(())),
-        })
-    }
-
-    pub fn read_only(
-        chain_id: u64,
-        execution_rpc_url: String,
-        router: &str,
-        wrapped_native: &str,
-        slippage_percent: u32,
-    ) -> Result<Self, String> {
-        let router = router.parse::<Address>().map_err(|e| format!("invalid router address: {e}"))?;
-        let wrapped_native = wrapped_native.parse::<Address>().map_err(|e| format!("invalid wrapped native address: {e}"))?;
-        if slippage_percent >= 100 {
-            return Err("EVM slippage_percent must be below 100".to_string());
-        }
-        Ok(Self {
-            chain_id,
-            execution_rpc_url,
-            private_rpc_url: None,
-            router,
-            wrapped_native,
-            slippage_percent,
-            signer: None,
+            signer,
             write_lock: Arc::new(Mutex::new(())),
         })
     }
 
     fn signer(&self) -> Result<&PrivateKeySigner, PortError> {
-        self.signer.as_ref().ok_or_else(|| {
-            PortError::Rejected("EVM exchange is configured read-only; live execution is disabled".to_string())
-        })
+        Ok(&self.signer)
     }
 
     async fn provider(&self) -> Result<impl Provider + Clone, PortError> {
@@ -548,21 +522,6 @@ impl ExchangeClient for EvmUniswapV2Exchange {
     }
 }
 
-pub struct NoWalletEvmExchange;
-
-#[async_trait]
-impl ExchangeClient for NoWalletEvmExchange {
-    fn venue_name(&self) -> &str { "evm-onchain" }
-    async fn current_price(&self, _symbol: &Symbol) -> Result<Decimal, PortError> {
-        Err(PortError::Rejected("EVM wallet is not configured".to_string()))
-    }
-    async fn submit_buy_by_amount(&self, _symbol: &Symbol, _quote_amount: Decimal) -> Result<FilledBuy, PortError> {
-        Err(PortError::Rejected("EVM wallet is not configured".to_string()))
-    }
-    async fn submit_order(&self, _order: Order) -> Result<FilledSell, PortError> {
-        Err(PortError::Rejected("EVM wallet is not configured".to_string()))
-    }
-}
 
 #[cfg(test)]
 mod tests {

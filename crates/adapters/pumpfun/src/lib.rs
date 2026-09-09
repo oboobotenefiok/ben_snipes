@@ -159,38 +159,3 @@ impl MetricsProvider for NotYetImplementedMetrics {
         Ok(None)
     }
 }
-
-/// `ExchangeClient` fallback used when no wallet is configured
-/// (`SOLANA_PRIVATE_KEY` unset) - see `execution::load_wallet`. Buy and
-/// sell genuinely work via `PumpPortalExchangeClient` once a wallet is
-/// present; this type exists so the bot can still run in
-/// detection-only mode without one, rather than refusing to start.
-/// `current_price` errors regardless of wallet configuration - live
-/// Solana price monitoring isn't built yet (see the crate/README docs),
-/// so this method is honest either way.
-pub struct NoWalletExchange;
-
-#[async_trait]
-impl ExchangeClient for NoWalletExchange {
-    fn venue_name(&self) -> &str {
-        "pumpfun"
-    }
-
-    async fn current_price(&self, _symbol: &Symbol) -> Result<Decimal, PortError> {
-        Err(PortError::Rejected(
-            "real-time Solana price monitoring is not yet implemented - see README".to_string(),
-        ))
-    }
-
-    async fn submit_buy_by_amount(&self, _symbol: &Symbol, _quote_amount: Decimal) -> Result<FilledBuy, PortError> {
-        Err(PortError::Rejected(
-            "no wallet configured (SOLANA_PRIVATE_KEY not set) - see execution module docs".to_string(),
-        ))
-    }
-
-    async fn submit_order(&self, _order: Order) -> Result<FilledSell, PortError> {
-        Err(PortError::Rejected(
-            "no wallet configured (SOLANA_PRIVATE_KEY not set) - see execution module docs".to_string(),
-        ))
-    }
-}

@@ -1,6 +1,7 @@
 use crate::PortError;
 use async_trait::async_trait;
 use ben_snipes_domain::{FilledBuy, FilledSell, Order, Symbol};
+use std::collections::HashMap;
 use rust_decimal::Decimal;
 
 /// Trading operations against a single venue. A CEX adapter implements
@@ -17,6 +18,17 @@ pub trait ExchangeClient: Send + Sync {
     /// take-profit/stop-loss) - not for entry sizing, see
     /// `submit_buy_by_amount`.
     async fn current_price(&self, symbol: &Symbol) -> Result<Decimal, PortError>;
+
+    /// Fetch multiple prices in one venue-specific batch. Implementations may
+    /// override this to use a native batch API; the default preserves the port
+    /// contract for venues that only expose single-price reads.
+    async fn current_prices_batch(&self, symbols: &[Symbol]) -> Result<HashMap<String, Decimal>, PortError> {
+        let mut prices = HashMap::with_capacity(symbols.len());
+        for symbol in symbols {
+            prices.insert(symbol.as_str().to_string(), self.current_price(symbol).await?);
+        }
+        Ok(prices)
+    }
 
     /// Buys `symbol` by spending `quote_amount` of the venue's quote
     /// asset (e.g. SOL, USDT), and reports back what was actually

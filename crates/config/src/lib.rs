@@ -14,18 +14,6 @@ pub enum ConfigError {
     Load(#[from] config::ConfigError),
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ExecutionMode {
-    /// Detection and real execution when wallets are configured.
-    #[default]
-    Live,
-    /// Run the complete strategy with real market data but simulate orders.
-    Paper,
-    /// Detect and evaluate listings, but never attempt acquisition or exits.
-    DetectionOnly,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiskConfig {
     /// Take-profit target as a percentage above entry price, e.g. 10.0
@@ -91,11 +79,21 @@ pub struct ObservabilityConfig {
     /// by the deployment environment.
     #[serde(default = "default_metrics_bind")]
     pub metrics_bind: String,
+    #[serde(default = "default_price_cache_ttl_seconds")]
+    pub price_cache_ttl_seconds: u64,
+    #[serde(default = "default_jupiter_max_retries")]
+    pub jupiter_max_retries: u32,
+    #[serde(default = "default_jupiter_circuit_breaker_failures")]
+    pub jupiter_circuit_breaker_failures: u32,
+    #[serde(default = "default_jupiter_circuit_breaker_cooldown_seconds")]
+    pub jupiter_circuit_breaker_cooldown_seconds: u64,
 }
 
-fn default_metrics_bind() -> String {
-    "127.0.0.1:9090".to_string()
-}
+fn default_metrics_bind() -> String { "127.0.0.1:9090".to_string() }
+fn default_price_cache_ttl_seconds() -> u64 { 30 }
+fn default_jupiter_max_retries() -> u32 { 3 }
+fn default_jupiter_circuit_breaker_failures() -> u32 { 3 }
+fn default_jupiter_circuit_breaker_cooldown_seconds() -> u64 { 60 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
@@ -170,8 +168,6 @@ fn default_evm_slippage_percent() -> u32 { 10 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
-    #[serde(default)]
-    pub execution_mode: ExecutionMode,
     pub risk: RiskConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,

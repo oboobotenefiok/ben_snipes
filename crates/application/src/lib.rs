@@ -10,12 +10,10 @@ mod acquisition_engine;
 mod backtest;
 mod new_listing_detector;
 mod position_manager;
-mod paper_exchange;
 mod runtime_metrics;
 
 pub use acquisition_engine::{AcquisitionDecision, AcquisitionEngine};
 pub use backtest::{BacktestConfig, BacktestEngine, BacktestEvent, BacktestReport, BacktestTrade};
 pub use new_listing_detector::NewListingDetector;
 pub use position_manager::{ExitResult, PositionManager};
-pub use paper_exchange::PaperExchange;
 pub use runtime_metrics::RuntimeMetrics;

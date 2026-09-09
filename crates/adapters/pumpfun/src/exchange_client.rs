@@ -5,7 +5,7 @@
 //! their side. See `execution`'s module doc comment for the signing-code
 //! verification caveat before running this with real funds.
 //!
-//! `current_price` is backed by `price_feed::fetch_price` (Jupiter's
+//! `current_price` is backed by the shared batched Jupiter price cache (Jupiter's
 //! Price API v3, converted to SOL-denominated terms to match
 //! `entry_price` elsewhere in this codebase - see that module's doc
 //! comment for why the conversion matters). This is a real,
@@ -30,6 +30,7 @@ use crate::retry::with_retry;
 use async_trait::async_trait;
 use ben_snipes_domain::{FilledBuy, FilledSell, Order, OrderSide, Symbol};
 use ben_snipes_ports::{ExchangeClient, PortError};
+use std::collections::HashMap;
 use rust_decimal::Decimal;
 use solana_sdk::signer::keypair::Keypair;
 use solana_sdk::signer::Signer;
@@ -53,37 +54,47 @@ const FEE_BUFFER_LAMPORTS: u64 = 5_000_000; // 0.005 SOL
 
 pub struct PumpPortalExchangeClient {
     http: reqwest::Client,
-    wallet: Option<Keypair>,
+    wallet: Keypair,
     rpc_url: String,
     slippage_percent: u32,
     priority_fee_sol: Decimal,
+    price_cache: price_feed::PriceCache,
 }
 
 impl PumpPortalExchangeClient {
-    pub fn new(wallet: Keypair, rpc_url: impl Into<String>, slippage_percent: u32, priority_fee_sol: Decimal) -> Self {
+    pub fn new(
+        wallet: Keypair,
+        rpc_url: impl Into<String>,
+        slippage_percent: u32,
+        priority_fee_sol: Decimal,
+        price_cache_ttl: Duration,
+        jupiter_max_retries: u32,
+        jupiter_circuit_breaker_failures: u32,
+        jupiter_circuit_breaker_cooldown: Duration,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
-            wallet: Some(wallet),
+            wallet,
             rpc_url: rpc_url.into(),
             slippage_percent,
             priority_fee_sol,
+            price_cache: price_feed::PriceCache::new(
+                price_cache_ttl,
+                jupiter_max_retries,
+                std::sync::Arc::new(price_feed::JupiterCircuitBreaker::new(
+                    jupiter_circuit_breaker_failures,
+                    jupiter_circuit_breaker_cooldown,
+                )),
+            ),
         }
     }
 
-    pub fn new_read_only(rpc_url: impl Into<String>) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            wallet: None,
-            rpc_url: rpc_url.into(),
-            slippage_percent: 0,
-            priority_fee_sol: Decimal::ZERO,
-        }
+    pub fn price_cache_stats(&self) -> price_feed::PriceCacheStats {
+        self.price_cache.stats()
     }
 
-    fn wallet(&self) -> Result<&Keypair, PortError> {
-        self.wallet.as_ref().ok_or_else(|| {
-            PortError::Rejected("Solana exchange is configured read-only; live execution is disabled".to_string())
-        })
+    fn wallet(&self) -> &Keypair {
+        &self.wallet
     }
 
     async fn wait_for_confirmation(&self, signature: &str) -> Result<(), PortError> {
@@ -357,7 +368,21 @@ impl ExchangeClient for PumpPortalExchangeClient {
     }
 
     async fn current_price(&self, symbol: &Symbol) -> Result<Decimal, PortError> {
-        price_feed::fetch_price(&self.http, symbol.as_str())
+        let prices = self
+            .price_cache
+            .get_or_fetch_batch(&self.http, &[symbol.as_str().to_string()])
+            .await
+            .map_err(PortError::Rejected)?;
+        prices
+            .get(symbol.as_str())
+            .copied()
+            .ok_or_else(|| PortError::Rejected(format!("Jupiter returned no price for {}", symbol.as_str())))
+    }
+
+    async fn current_prices_batch(&self, symbols: &[Symbol]) -> Result<HashMap<String, Decimal>, PortError> {
+        let mints: Vec<String> = symbols.iter().map(|symbol| symbol.as_str().to_string()).collect();
+        self.price_cache
+            .get_or_fetch_batch(&self.http, &mints)
             .await
             .map_err(PortError::Rejected)
     }

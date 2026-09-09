@@ -100,18 +100,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "ben_snipes-adapter-dex-mock"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "ben_snipes-domain",
- "ben_snipes-ports",
- "rust_decimal",
- "time",
- "tokio",
-]
-
-[[package]]
 name = "ben_snipes-adapter-evm-onchain"
 version = "0.1.0"
 dependencies = [
@@ -223,7 +211,6 @@ dependencies = [
 name = "ben_snipes-runner"
 version = "0.1.0"
 dependencies = [
- "ben_snipes-adapter-dex-mock",
  "ben_snipes-adapter-evm-onchain",
  "ben_snipes-adapter-pumpfun",
  "ben_snipes-adapter-statefile",
