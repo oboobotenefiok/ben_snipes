@@ -23,9 +23,9 @@ max_position_size = "0.01"
 # measurable 24h activity qualifies. The goal is to catch listings as
 # early as possible rather than wait for substantial volume.
 min_volume_24h = "1"
-max_open_positions = 3
-max_consecutive_failures = 5
-max_new_listings_per_cycle = 20
+max_open_positions = 1000000
+max_consecutive_failures = 1000000
+max_new_listings_per_cycle = 1000000
 entry_kill_switch_file = "state/STOP_ENTRIES"
 
 
