@@ -94,12 +94,25 @@ pub struct SolanaConfig {
     /// endpoint - no API key needed for `subscribeNewToken`.
     pub pumpportal_ws_url: String,
 
-    /// A Solana JSON-RPC HTTP endpoint used for broadcasting signed
-    /// transactions and checking balances/confirmations. Unlike
-    /// `pumpportal_ws_url`, this should be your own provider (public
+    /// Solana JSON-RPC HTTP endpoint for retried, idempotent reads
+    /// (`getBalance`, `getTokenAccountsByOwner`, `getTransaction`). Safe
+    /// to point at a shared/public endpoint, since every call here goes
+    /// through `with_retry`.
+    pub read_rpc_url: String,
+
+    /// Solana JSON-RPC HTTP endpoint for the critical, un-retried calls
+    /// (`simulateTransaction`, `sendTransaction`). Unlike
+    /// `read_rpc_url`, this should be your own provider - public
     /// endpoints are typically rate-limited too aggressively for
-    /// trading use).
-    pub rpc_url: String,
+    /// trading use, and a failure here loses the trade outright since
+    /// there is no retry.
+    pub write_rpc_url: String,
+
+    /// Optional dedicated endpoint for `getSignatureStatuses`
+    /// confirmation polling. Falls back to `write_rpc_url` when absent -
+    /// see `confirm_rpc_url()`.
+    #[serde(default)]
+    pub confirm_rpc_url: Option<String>,
 
     /// Slippage tolerance, as a percent, passed through to PumpPortal's
     /// trade-local API on every buy/sell.
@@ -125,6 +138,17 @@ pub struct SolanaConfig {
     /// How long the Jupiter circuit breaker stays open once tripped.
     #[serde(default = "default_jupiter_circuit_breaker_cooldown_seconds")]
     pub jupiter_circuit_breaker_cooldown_seconds: u64,
+}
+
+impl SolanaConfig {
+    /// The endpoint used for `getSignatureStatuses` polling. Falls back
+    /// to the write endpoint when no separate confirm endpoint is
+    /// configured - the write node has the transaction in its mempool
+    /// cache, which gives the fastest and most consistent confirmation
+    /// view.
+    pub fn confirm_rpc_url(&self) -> &str {
+        self.confirm_rpc_url.as_deref().unwrap_or(&self.write_rpc_url)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -38,7 +38,7 @@ pub mod execution;
 pub mod metrics_provider;
 pub mod price_feed;
 pub mod retry;
-pub use exchange_client::PumpPortalExchangeClient;
+pub use exchange_client::{PumpPortalExchangeClient, SolanaRpc};
 pub use execution::{execute_trade, load_wallet, wallet_pubkey_string, TradeAction, TradeRequest};
 pub use metrics_provider::DexScreenerMetricsProvider;
 

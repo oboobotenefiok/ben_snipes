@@ -38,12 +38,23 @@ state_dir = "state"
 # self-hosted relay or a different environment.
 pumpportal_ws_url = "wss://pumpportal.fun/api/data"
 
-# Public RPC endpoints are typically rate-limited too aggressively for
-# real trading (broadcast + confirmation polling + balance checks add
-# up fast) - replace this with your own provider before running with a
-# funded wallet. The bot requires SOLANA_PRIVATE_KEY at startup and
-# fails clearly if it is missing.
-rpc_url = "https://api.mainnet-beta.solana.com"
+# Public / shared endpoint for retried, idempotent reads
+# (getBalance, getTokenAccountsByOwner, getTransaction). Safe to run on
+# a rate-limited endpoint because every call here is retried.
+read_rpc_url = "https://api.mainnet-beta.solana.com"
+
+# Dedicated endpoint for simulateTransaction and sendTransaction. These
+# are called once with no retry - a failure here loses the trade - so
+# this must be your own provider, not a shared public endpoint. The
+# bot requires SOLANA_PRIVATE_KEY at startup and fails clearly if it is
+# missing.
+write_rpc_url = "https://api.mainnet-beta.solana.com"
+
+# Optional. Used for getSignatureStatuses confirmation polling. Leave
+# empty to use write_rpc_url (recommended - same node, warmer cache).
+# Set to a public endpoint only if you need to conserve write-endpoint
+# quota and accept slower confirmation discovery.
+# confirm_rpc_url = ""
 
 # Passed straight through to PumpPortal's trade-local API on every
 # buy/sell.

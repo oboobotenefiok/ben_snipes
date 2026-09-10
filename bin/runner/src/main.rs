@@ -19,6 +19,7 @@ use ben_snipes_adapter_evm_onchain::{
 };
 use ben_snipes_adapter_pumpfun::{
     load_wallet, wallet_pubkey_string, DexScreenerMetricsProvider, PumpPortalExchangeClient, PumpPortalSource,
+    SolanaRpc,
 };
 use ben_snipes_adapter_statefile::{
     FileAcquisitionLedger, FilePendingTradeStore, FilePositionStore, FileTradeStore, InstanceLock,
@@ -68,6 +69,13 @@ struct RiskParams {
 }
 
 
+/// Strips any query string (e.g. `?api-key=...`) from an RPC URL before
+/// it goes into a log line - many providers embed the API key there,
+/// and this is a startup log, not a place secrets belong.
+fn redact_rpc_url(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
+}
+
 fn validate_runtime_config(config: &AppConfig) -> Result<(), String> {
     if config.risk.poll_interval_seconds == 0 {
         return Err("risk.poll_interval_seconds must be greater than zero".to_string());
@@ -83,6 +91,12 @@ fn validate_runtime_config(config: &AppConfig) -> Result<(), String> {
     }
     if config.risk.pending_listing_retry_seconds == 0 {
         return Err("risk.pending_listing_retry_seconds must be greater than zero".to_string());
+    }
+    if config.solana.read_rpc_url.trim().is_empty() {
+        return Err("solana.read_rpc_url must not be empty".to_string());
+    }
+    if config.solana.write_rpc_url.trim().is_empty() {
+        return Err("solana.write_rpc_url must not be empty".to_string());
     }
     if config.solana.price_cache_ttl_seconds == 0 {
         return Err("solana.price_cache_ttl_seconds must be greater than zero".to_string());
@@ -133,9 +147,14 @@ async fn build_venues(
         PumpPortalSource::spawn(config.solana.pumpportal_ws_url.clone()),
         "solana pumpportal source",
     );
+    let solana_rpc = SolanaRpc {
+        read_url: config.solana.read_rpc_url.clone(),
+        write_url: config.solana.write_rpc_url.clone(),
+        confirm_url: config.solana.confirm_rpc_url().to_string(),
+    };
     let solana_exchange = Arc::new(PumpPortalExchangeClient::new(
         wallet,
-        config.solana.rpc_url.clone(),
+        solana_rpc,
         config.solana.slippage_percent,
         config.solana.priority_fee_sol,
         Duration::from_secs(config.solana.price_cache_ttl_seconds),
@@ -297,18 +316,39 @@ async fn main() {
         ),
     };
 
-    info!(
-        take_profit_percent = %config.risk.take_profit_percent,
-        min_volume_24h = %config.risk.min_volume_24h,
-        max_position_size = %config.risk.max_position_size,
-        max_open_positions = config.risk.max_open_positions,
-        max_consecutive_failures = config.risk.max_consecutive_failures,
-        max_new_listings_per_cycle = config.risk.max_new_listings_per_cycle,
-        entry_kill_switch_file = %config.risk.entry_kill_switch_file,
-        evm_chains = config.evm_chains.len(),
-        poll_interval_seconds = config.risk.poll_interval_seconds,
-        "ben_snipes starting up"
-    );
+    let confirm_rpc_url = config.solana.confirm_rpc_url();
+    if confirm_rpc_url == config.solana.write_rpc_url {
+        info!(
+            take_profit_percent = %config.risk.take_profit_percent,
+            min_volume_24h = %config.risk.min_volume_24h,
+            max_position_size = %config.risk.max_position_size,
+            max_open_positions = config.risk.max_open_positions,
+            max_consecutive_failures = config.risk.max_consecutive_failures,
+            max_new_listings_per_cycle = config.risk.max_new_listings_per_cycle,
+            entry_kill_switch_file = %config.risk.entry_kill_switch_file,
+            evm_chains = config.evm_chains.len(),
+            poll_interval_seconds = config.risk.poll_interval_seconds,
+            read_rpc_url = %redact_rpc_url(&config.solana.read_rpc_url),
+            write_rpc_url = %redact_rpc_url(&config.solana.write_rpc_url),
+            "ben_snipes starting up"
+        );
+    } else {
+        info!(
+            take_profit_percent = %config.risk.take_profit_percent,
+            min_volume_24h = %config.risk.min_volume_24h,
+            max_position_size = %config.risk.max_position_size,
+            max_open_positions = config.risk.max_open_positions,
+            max_consecutive_failures = config.risk.max_consecutive_failures,
+            max_new_listings_per_cycle = config.risk.max_new_listings_per_cycle,
+            entry_kill_switch_file = %config.risk.entry_kill_switch_file,
+            evm_chains = config.evm_chains.len(),
+            poll_interval_seconds = config.risk.poll_interval_seconds,
+            read_rpc_url = %redact_rpc_url(&config.solana.read_rpc_url),
+            write_rpc_url = %redact_rpc_url(&config.solana.write_rpc_url),
+            confirm_rpc_url = %redact_rpc_url(confirm_rpc_url),
+            "ben_snipes starting up"
+        );
+    }
 
     let state_store = Arc::new(StatefileStore::new(&config.storage.state_dir));
     let detector = NewListingDetector::new(state_store, Arc::new(SystemClock));

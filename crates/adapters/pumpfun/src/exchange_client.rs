@@ -52,10 +52,20 @@ const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 /// attempting a trade, not computing the precise fee.
 const FEE_BUFFER_LAMPORTS: u64 = 5_000_000; // 0.005 SOL
 
+/// The three role-specific Solana RPC endpoints this client routes
+/// calls to. See the module-level docs for why reads, writes, and
+/// confirmation polling are split rather than sharing one endpoint.
+#[derive(Clone)]
+pub struct SolanaRpc {
+    pub read_url: String,
+    pub write_url: String,
+    pub confirm_url: String,
+}
+
 pub struct PumpPortalExchangeClient {
     http: reqwest::Client,
     wallet: Keypair,
-    rpc_url: String,
+    rpc: SolanaRpc,
     slippage_percent: u32,
     priority_fee_sol: Decimal,
     price_cache: price_feed::PriceCache,
@@ -64,7 +74,7 @@ pub struct PumpPortalExchangeClient {
 impl PumpPortalExchangeClient {
     pub fn new(
         wallet: Keypair,
-        rpc_url: impl Into<String>,
+        rpc: SolanaRpc,
         slippage_percent: u32,
         priority_fee_sol: Decimal,
         price_cache_ttl: Duration,
@@ -75,7 +85,7 @@ impl PumpPortalExchangeClient {
         Self {
             http: reqwest::Client::new(),
             wallet,
-            rpc_url: rpc_url.into(),
+            rpc,
             slippage_percent,
             priority_fee_sol,
             price_cache: price_feed::PriceCache::new(
@@ -113,7 +123,7 @@ impl PumpPortalExchangeClient {
             let outcome: Option<Result<(), PortError>> = async {
                 let response = self
                     .http
-                    .post(&self.rpc_url)
+                    .post(&self.rpc.confirm_url)
                     .header("Content-Type", "application/json")
                     .body(body.to_string())
                     .send()
@@ -174,7 +184,7 @@ impl PumpPortalExchangeClient {
 
             let response = self
                 .http
-                .post(&self.rpc_url)
+                .post(&self.rpc.read_url)
                 .header("Content-Type", "application/json")
                 .body(body.to_string())
                 .send()
@@ -221,7 +231,7 @@ impl PumpPortalExchangeClient {
 
             let response = self
                 .http
-                .post(&self.rpc_url)
+                .post(&self.rpc.read_url)
                 .header("Content-Type", "application/json")
                 .body(body.to_string())
                 .send()
@@ -274,7 +284,7 @@ impl PumpPortalExchangeClient {
 
             let response = self
                 .http
-                .post(&self.rpc_url)
+                .post(&self.rpc.read_url)
                 .header("Content-Type", "application/json")
                 .body(body.to_string())
                 .send()
@@ -418,7 +428,7 @@ impl ExchangeClient for PumpPortalExchangeClient {
             priority_fee_sol: self.priority_fee_sol,
         };
 
-        let signature = execute_trade(&self.http, self.wallet(), &self.rpc_url, &request)
+        let signature = execute_trade(&self.http, self.wallet(), &self.rpc.write_url, &request)
             .await
             .map_err(PortError::Rejected)?;
 
@@ -458,7 +468,7 @@ impl ExchangeClient for PumpPortalExchangeClient {
             priority_fee_sol: self.priority_fee_sol,
         };
 
-        preflight_trade(&self.http, self.wallet(), &self.rpc_url, &request)
+        preflight_trade(&self.http, self.wallet(), &self.rpc.write_url, &request)
             .await
             .map_err(PortError::Rejected)
     }
@@ -480,7 +490,7 @@ impl ExchangeClient for PumpPortalExchangeClient {
 
         let previous_quantity = self.token_balance(order.symbol.as_str()).await?;
 
-        let signature = execute_trade(&self.http, self.wallet(), &self.rpc_url, &request)
+        let signature = execute_trade(&self.http, self.wallet(), &self.rpc.write_url, &request)
             .await
             .map_err(PortError::Rejected)?;
 
@@ -513,6 +523,15 @@ impl ExchangeClient for PumpPortalExchangeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ben_snipes_config::SolanaConfig;
+
+    fn dummy_rpc() -> SolanaRpc {
+        SolanaRpc {
+            read_url: "https://read.example".to_string(),
+            write_url: "https://write.example".to_string(),
+            confirm_url: "https://confirm.example".to_string(),
+        }
+    }
 
     #[test]
     fn buy_balance_requirement_includes_fee_buffer_and_priority_fee() {
@@ -522,5 +541,41 @@ mod tests {
             quote_amount + priority_fee_sol + Decimal::from(FEE_BUFFER_LAMPORTS) / Decimal::from(LAMPORTS_PER_SOL);
 
         assert_eq!(required_balance, Decimal::new(151, 4));
+    }
+
+    #[test]
+    fn solana_rpc_routes_each_role_to_the_correct_field() {
+        let rpc = dummy_rpc();
+        assert_eq!(rpc.read_url, "https://read.example");
+        assert_eq!(rpc.write_url, "https://write.example");
+        assert_eq!(rpc.confirm_url, "https://confirm.example");
+    }
+
+    fn base_solana_config() -> SolanaConfig {
+        SolanaConfig {
+            pumpportal_ws_url: "wss://example/data".to_string(),
+            read_rpc_url: "https://read.example".to_string(),
+            write_rpc_url: "https://write.example".to_string(),
+            confirm_rpc_url: None,
+            slippage_percent: 10,
+            priority_fee_sol: Decimal::new(1, 4),
+            price_cache_ttl_seconds: 30,
+            jupiter_max_retries: 3,
+            jupiter_circuit_breaker_failures: 3,
+            jupiter_circuit_breaker_cooldown_seconds: 60,
+        }
+    }
+
+    #[test]
+    fn confirm_rpc_url_falls_back_to_write_url_when_unset() {
+        let config = base_solana_config();
+        assert_eq!(config.confirm_rpc_url(), "https://write.example");
+    }
+
+    #[test]
+    fn confirm_rpc_url_uses_explicit_value_when_set() {
+        let mut config = base_solana_config();
+        config.confirm_rpc_url = Some("https://confirm.example".to_string());
+        assert_eq!(config.confirm_rpc_url(), "https://confirm.example");
     }
 }
